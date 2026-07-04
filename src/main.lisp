@@ -34,6 +34,12 @@
      (loom:run)                         ; the bundled home page
      (loom:run :start \"https://example.com\")
      (loom:run :start \"/path/to/page.html\")"
+  ;; SBCL enables floating-point traps (:invalid :overflow :divide-by-zero) by
+  ;; default; SDL and the platform window layer (Cocoa/Metal retina scaling on
+  ;; macOS) do FP math that produces NaN/Inf, which would trap the process.  C
+  ;; graphics code expects those masked, so disable traps for the session — the
+  ;; render engine already tolerates degenerate values (it runs trap-free on Linux).
+  #+sbcl (sb-int:set-floating-point-modes :traps nil)
   (sdl:init)
   (unwind-protect
        (run-shell (open-start-page start :width width :height height)
