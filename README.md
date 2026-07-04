@@ -3,9 +3,15 @@
 **loom** is the interactive browser shell for [**weft**](../weft), a web engine
 written in pure Common Lisp. weft does the whole pipeline — fetch, HTML parse,
 CSS cascade, JavaScript, layout, paint to an RGB8 canvas. loom is the *platform
-shell*: it opens a native window with [cl-sdl2](https://github.com/lispgames/cl-sdl2)
-(SDL2 via CFFI), blits weft's painted canvas into it, and translates window input
-into the DOM events weft already dispatches.
+shell*: it opens a native window over SDL2, blits weft's painted canvas into it,
+and translates window input into the DOM events weft already dispatches.
+
+The SDL2 binding is a small **hand-written CFFI layer** (`src/sdl-ffi.lisp`) over
+the dozen SDL functions loom actually calls — *not* cl-sdl2. cl-sdl2 uses
+cl-autowrap, which shells out to [c2ffi](https://github.com/rpav/c2ffi) (an LLVM
+tool) at build time to regenerate its bindings from the SDL headers; c2ffi is
+painful to install, especially on macOS. So loom's only dependencies are `cffi`
+(pure Quicklisp) plus the SDL2 shared library — no c2ffi, no autowrap.
 
 **loom is the one place FFI is allowed.** The engine stack
 (scribe / shuttle / gesso / stencil / weft) stays pure Common Lisp; only the
@@ -39,10 +45,15 @@ shell talks to SDL.
 ## Running it (macOS)
 
 ```sh
-brew install sdl2                     # the SDL2 native library
+brew install sdl2                     # the SDL2 native library (the ONLY C dep)
 # a Common Lisp with Quicklisp (SBCL recommended):
 #   brew install sbcl
 #   then install Quicklisp: https://www.quicklisp.org/beta/
+# Quicklisp pulls in cffi automatically — no c2ffi / cl-autowrap / cl-sdl2 needed.
+#
+# Homebrew installs libSDL2 under /opt/homebrew/lib (Apple Silicon) or
+# /usr/local/lib (Intel); loom adds both to the CFFI search path, so no
+# DYLD_LIBRARY_PATH juggling is required.
 
 # make weft + its engine siblings and loom visible to ASDF/Quicklisp, e.g.
 #   ln -s /path/to/loom ~/quicklisp/local-projects/loom
@@ -66,12 +77,12 @@ Or with the helper script:
 ### macOS main-thread note (the #1 gotcha)
 
 Cocoa requires the window and event loop to run on the **process main thread**.
-`loom:run` handles this: it enters SDL through `sdl2:make-this-thread-main`, which
-designates the calling thread as SDL's main thread and runs the window loop there.
-As long as you call `(loom:run)` from the REPL's initial thread (or a
-`sbcl --eval` invocation, which runs on the main thread), the window comes up
-correctly. If you spawn loom from a *different* thread you will get a silent
-failure or a Cocoa abort — always drive `loom:run` from the main thread.
+`loom:run` runs the window loop on the thread it is called from, so you must call
+it on the initial/main thread: an `sbcl --eval` invocation (or `./run.sh`) runs
+on the process main thread, as does the REPL's initial thread. If you spawn loom
+from a *different* thread — a `bordeaux-threads` worker, or a SLIME/Swank
+evaluation thread — you will get a silent failure or a Cocoa abort. Always drive
+`loom:run` from the main thread (the `sbcl --eval` / `run.sh` path).
 
 On Linux/Windows the same entry point works (SDL runs its loop on the calling
 thread); the main-thread requirement is macOS-specific.
@@ -80,9 +91,10 @@ thread); the main-thread requirement is macOS-specific.
 
 | file | role |
 |------|------|
+| `src/sdl-ffi.lisp` | hand-written CFFI bindings to libSDL2 (**the only FFI**): window, renderer, streaming texture, event union decoding |
 | `src/input.lisp` | pure SDL→DOM translation + scroll/URL math (no SDL) |
 | `src/page.lisp`  | the persistent page model: load, render, hit-test, dispatch, scroll, navigate (no SDL) |
-| `src/shell.lisp` | the SDL glue: window, renderer, streaming texture, blit, event loop (**the only FFI**) |
+| `src/shell.lisp` | the SDL glue: window, renderer, streaming texture, blit, event loop |
 | `src/main.lisp`  | `loom:run` / `loom:main` — the macOS-safe entry point + CLI |
 
 The correctness-critical logic lives in `input.lisp` + `page.lisp` and is fully

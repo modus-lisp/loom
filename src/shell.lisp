@@ -1,14 +1,14 @@
-;;;; src/shell.lisp — the SDL2 window, texture upload and event loop (FFI).
+;;;; src/shell.lisp — the SDL2 window, texture upload and event loop.
 ;;;;
-;;;; This is the only file in the whole stack that touches FFI (through cl-sdl2).
-;;;; It owns the window + renderer + a streaming RGB24 texture matching weft's
-;;;; canvas, blits the current page's painted pixels into it each frame, and
-;;;; feeds SDL input into the page model (page.lisp), which turns it into the DOM
-;;;; events weft dispatches.
+;;;; The driver over the page model (page.lisp): it owns the window + renderer +
+;;;; a streaming RGB24 texture matching weft's canvas, blits the current page's
+;;;; painted pixels into it each frame, and feeds SDL input into the page model,
+;;;; which turns it into the DOM events weft dispatches.  All SDL access goes
+;;;; through the LOOM.SDL CFFI layer (sdl-ffi.lisp) — no raw FFI here.
 ;;;;
 ;;;; macOS note: Cocoa requires the window and event pump to run on the process
-;;;; main thread.  RUN (main.lisp) enters through sdl2:make-this-thread-main so
-;;;; this loop runs on the initial thread — see the README.
+;;;; main thread.  RUN (main.lisp) is called on the initial thread (the
+;;;; sbcl --eval / run.sh path), so this loop runs there — see the README.
 (in-package #:loom)
 
 (defstruct app
@@ -25,10 +25,10 @@
   "Create (or recreate) the streaming texture at W x H, matching the window."
   (when (and (app-texture app)
              (or (/= w (app-tex-w app)) (/= h (app-tex-h app))))
-    (sdl2:destroy-texture (app-texture app))
+    (sdl:destroy-texture (app-texture app))
     (setf (app-texture app) nil))
   (unless (app-texture app)
-    (setf (app-texture app) (sdl2:create-texture (app-renderer app) :rgb24 :streaming w h)
+    (setf (app-texture app) (sdl:create-texture (app-renderer app) w h)
           (app-tex-w app) w (app-tex-h app) h)))
 
 (defun blit (app)
@@ -48,14 +48,14 @@
     (when (plusp vis)
       (cffi:with-pointer-to-vector-data (base px)
         (let ((src (cffi:inc-pointer base (* sy w 3))))
-          (sdl2:update-texture (app-texture app) (sdl2:make-rect 0 0 w vis) src (* w 3)))))
-    (sdl2:set-render-draw-color rr 255 255 255 255)
-    (sdl2:render-clear rr)
+          (sdl:update-texture (app-texture app) 0 0 w vis src (* w 3)))))
+    (sdl:set-render-draw-color rr 255 255 255 255)
+    (sdl:render-clear rr)
     (when (plusp vis)
-      (sdl2:render-copy rr (app-texture app)
-                        :source-rect (sdl2:make-rect 0 0 w vis)
-                        :dest-rect (sdl2:make-rect 0 0 w vis)))
-    (sdl2:render-present rr)))
+      (sdl:render-copy rr (app-texture app)
+                       :src (list 0 0 w vis)
+                       :dst (list 0 0 w vis)))
+    (sdl:render-present rr)))
 
 ;;; ---------------------------------------------------------------------------
 ;;; SDL event -> page model
@@ -73,7 +73,7 @@
                   (load-url target :width w :viewport-height h)
                   (load-file (namestring (url->path target)) :width w :viewport-height h)))
         (wire-navigation app)
-        (when (app-window app) (sdl2:set-window-title (app-window app) (page-title (app-page app))))
+        (when (app-window app) (sdl:set-window-title (app-window app) (page-title (app-page app))))
         (setf (app-dirty app) t))
     (error (e) (format *error-output* "~&loom: navigation to ~a failed: ~a~%" target e))))
 
@@ -87,43 +87,32 @@
         (lambda (pg target) (declare (ignore pg)) (navigate-to app target))))
 
 (defun handle-event (app ev)
-  "Translate one SDL event into page-model calls."
+  "Translate one SDL event (a plist from SDL:POLL-EVENT) into page-model calls."
   (let ((pg (app-page app)))
-    (case (sdl2:get-event-type ev)
+    (case (getf ev :type)
       (:quit (setf (app-running app) nil))
       (:mousebuttondown
-       (let ((x (plus-c:c-ref ev sdl2-ffi:sdl-event :button :x))
-             (y (plus-c:c-ref ev sdl2-ffi:sdl-event :button :y))
-             (b (plus-c:c-ref ev sdl2-ffi:sdl-event :button :button)))
-         (mouse-press pg x y (sdl-button->dom b))
-         (setf (app-dirty app) t)))
+       (mouse-press pg (getf ev :x) (getf ev :y) (sdl-button->dom (getf ev :button)))
+       (setf (app-dirty app) t))
       (:mousebuttonup
-       (let ((x (plus-c:c-ref ev sdl2-ffi:sdl-event :button :x))
-             (y (plus-c:c-ref ev sdl2-ffi:sdl-event :button :y))
-             (b (plus-c:c-ref ev sdl2-ffi:sdl-event :button :button)))
-         (mouse-release pg x y (sdl-button->dom b))
-         (setf (app-dirty app) t)))
+       (mouse-release pg (getf ev :x) (getf ev :y) (sdl-button->dom (getf ev :button)))
+       (setf (app-dirty app) t))
       (:mousemotion
-       (let ((x (plus-c:c-ref ev sdl2-ffi:sdl-event :motion :x))
-             (y (plus-c:c-ref ev sdl2-ffi:sdl-event :motion :y)))
-         (mouse-move pg x y)
-         (setf (app-dirty app) t)))
+       (mouse-move pg (getf ev :x) (getf ev :y))
+       (setf (app-dirty app) t))
       (:mousewheel
-       (let ((wy (plus-c:c-ref ev sdl2-ffi:sdl-event :wheel :y)))
-         (mouse-wheel pg wy)
-         (setf (app-dirty app) t)))
+       (mouse-wheel pg (getf ev :y))
+       (setf (app-dirty app) t))
       (:keydown
-       (let* ((ks (plus-c:c-ref ev sdl2-ffi:sdl-event :key :keysym))
-              (sym (sdl2:sym-value ks)))
+       (let ((sym (getf ev :sym)))
          (key-down pg (key-name sym) :key-code sym)
          (setf (app-dirty app) t)))
       (:textinput
-       (let ((s (plus-c:c-ref ev sdl2-ffi:sdl-event :text :text :string)))
-         (key-text pg s)
-         (setf (app-dirty app) t)))
+       (key-text pg (getf ev :text))
+       (setf (app-dirty app) t))
       (:windowevent
        ;; any window event: reconcile the layout width with the current size
-       (multiple-value-bind (w h) (sdl2:get-window-size (app-window app))
+       (multiple-value-bind (w h) (sdl:window-size (app-window app))
          (when (or (/= w (page-width pg)) (/= h (page-viewport-height pg)))
            (relayout pg w h)
            (setf (app-dirty app) t)))))))
@@ -139,41 +128,41 @@
 (defun run-loop (app &key max-iterations)
   "Poll SDL events, pump the page's timer loop, and blit.  Runs until a quit
    event (or, headlessly, until MAX-ITERATIONS frames)."
-  (sdl2:with-sdl-event (ev)
-    (loop with i = 0
-          while (and (app-running app)
-                     (or (null max-iterations) (< i max-iterations)))
-          do (loop while (= 1 (sdl2:next-event ev :poll))
-                   do (handle-event app ev))
-             ;; advance timers/animations one frame every iteration; repaint if a
-             ;; timer fired and mutated the DOM
-             (when (pump (app-page app))
-               (setf (app-dirty app) t))
-             (when (app-dirty app)
-               (blit app)
-               (setf (app-dirty app) nil))
-             (incf i)
-             (unless max-iterations (sdl2:delay 8)))))
+  (loop with i = 0
+        while (and (app-running app)
+                   (or (null max-iterations) (< i max-iterations)))
+        do (loop for ev = (sdl:poll-event) while ev
+                 do (handle-event app ev))
+           ;; advance timers/animations one frame every iteration; repaint if a
+           ;; timer fired and mutated the DOM
+           (when (pump (app-page app))
+             (setf (app-dirty app) t))
+           (when (app-dirty app)
+             (blit app)
+             (setf (app-dirty app) nil))
+           (incf i)
+           (unless max-iterations (sdl:delay 8))))
 
 (defun make-renderer (win)
   "A renderer for WIN: accelerated+vsync if available (the laptop path), else a
    software renderer (the headless/dummy-driver path)."
-  (or (ignore-errors (sdl2:create-renderer win nil '(:accelerated :presentvsync)))
-      (ignore-errors (sdl2:create-renderer win nil '(:software)))
-      (sdl2:create-renderer win nil nil)))
+  (or (ignore-errors (sdl:create-renderer win '(:accelerated :presentvsync)))
+      (ignore-errors (sdl:create-renderer win '(:software)))
+      (sdl:create-renderer win nil)))
 
 (defun run-shell (page &key (width 1024) (height 768) max-iterations)
   "Open a window + renderer + texture for PAGE and run the event loop.  Assumes
    SDL video is initialized and this is the main thread (see RUN).  Returns the
    final APP (useful for headless inspection)."
-  (let ((win (sdl2:create-window :title (page-title page) :w width :h height
-                                 :flags '(:shown :resizable))))
+  (let ((win (sdl:create-window (page-title page) width height
+                                :shown t :resizable t)))
     (unwind-protect
          (let* ((rr (make-renderer win))
                 (app (make-app :window win :renderer rr :page page)))
-           (handler-case (sdl2:set-window-title win (page-title page)) (error () nil))
+           (handler-case (sdl:set-window-title win (page-title page)) (error () nil))
            (wire-navigation app)
            (blit app)
            (run-loop app :max-iterations max-iterations)
+           (sdl:destroy-renderer rr)
            app)
-      (sdl2:destroy-window win))))
+      (sdl:destroy-window win))))

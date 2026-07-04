@@ -8,7 +8,7 @@
 ;;;;
 ;;;;   SDL_VIDEODRIVER=dummy sbcl --script inspect/smoke.lisp
 (require "asdf")
-;; --script skips ~/.sbclrc, so bootstrap quicklisp explicitly for the sdl2 dep.
+;; --script skips ~/.sbclrc, so bootstrap quicklisp explicitly for the cffi dep.
 (let ((ql (merge-pathnames "quicklisp/setup.lisp" (user-homedir-pathname))))
   (when (probe-file ql) (load ql)))
 (push (truename (merge-pathnames "../" (directory-namestring *load-truename*)))
@@ -18,7 +18,9 @@
 (in-package #:loom)
 
 (defun smoke (&key (out "/home/claude/loom/inspect/smoke.png"))
-  (sdl2:with-init (:video)
+  (sdl:init)
+  (unwind-protect
+   (progn
     (format t "~&SDL initialized (driver: ~a)~%"
             (or (uiop:getenv "SDL_VIDEODRIVER") "default"))
     (let* ((home (namestring (default-home)))
@@ -40,7 +42,8 @@
       (let ((app (run-shell page :width 1024 :height 768 :max-iterations 8)))
         (format t "shell ran: texture ~dx~d, 8 iterations, final scroll-y ~d~%"
                 (app-tex-w app) (app-tex-h app) (page-scroll-y (app-page app))))
-      (format t "SMOKE-OK~%"))))
+      (format t "SMOKE-OK~%")))
+   (sdl:quit)))
 
 (handler-case (smoke)
   (error (e) (format t "~&SMOKE-FAIL: ~a~%" e) (uiop:quit 1)))

@@ -1,9 +1,10 @@
 ;;;; src/main.lisp — the run entrypoint and CLI.
 ;;;;
-;;;; RUN is the one call a user makes.  It enters SDL through
-;;;; sdl2:make-this-thread-main so the window + event loop run on the process
-;;;; main thread, which macOS/Cocoa requires (see the README), then opens the
-;;;; window on the start page (a CLI URL/path, or the bundled home page).
+;;;; RUN is the one call a user makes.  It initializes SDL and opens the window
+;;;; on the start page (a CLI URL/path, or the bundled home page).  macOS/Cocoa
+;;;; requires the window + event loop to run on the process main thread; RUN must
+;;;; therefore be called on the initial thread (the sbcl --eval / run.sh path,
+;;;; not a spawned thread or a SLIME worker) — see the README.
 (in-package #:loom)
 
 (defun default-home ()
@@ -26,20 +27,18 @@
     (t (load-file start :width width :viewport-height height))))
 
 (defun run (&key start (width 1024) (height 768))
-  "Open loom's window on START and browse.  This is the macOS-safe entry: it runs
-   the SDL window and event loop on the process main thread via
-   sdl2:make-this-thread-main.
+  "Open loom's window on START and browse.  Call this on the process main thread
+   (macOS/Cocoa requires it) — i.e. from the REPL's initial thread or an
+   sbcl --eval / run.sh invocation, not a spawned thread.
 
      (loom:run)                         ; the bundled home page
      (loom:run :start \"https://example.com\")
      (loom:run :start \"/path/to/page.html\")"
-  (sdl2:make-this-thread-main
-   (lambda ()
-     (sdl2:with-init (:video)
-       (unwind-protect
-            (run-shell (open-start-page start :width width :height height)
-                       :width width :height height)
-         (sdl2:push-quit-event))))))
+  (sdl:init)
+  (unwind-protect
+       (run-shell (open-start-page start :width width :height height)
+                  :width width :height height)
+    (sdl:quit)))
 
 (defun main ()
   "CLI entry: the first argv is an optional start URL/path."
