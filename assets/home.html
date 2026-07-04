@@ -1,0 +1,72 @@
+<!DOCTYPE html>
+<html>
+<head>
+<title>loom — home</title>
+<style>
+  body { font-family: sans-serif; margin: 0; background: #f6f7f9; color: #1a1a1a; }
+  header { background: #2b3a55; color: #fff; padding: 20px 28px; }
+  header h1 { margin: 0; font-size: 26px; }
+  header p { margin: 6px 0 0; color: #b9c4da; }
+  main { padding: 24px 28px; max-width: 760px; }
+  .card { background: #fff; border: 1px solid #dde1e7; border-radius: 8px;
+          padding: 18px 20px; margin: 0 0 18px; }
+  .card h2 { margin: 0 0 8px; font-size: 18px; }
+  a { color: #2b6cb0; }
+  button { font-size: 15px; padding: 8px 14px; border: 0; border-radius: 6px;
+           background: #2b6cb0; color: #fff; }
+  #hot { display: inline-block; padding: 6px 10px; border-radius: 6px;
+         background: #eef2f8; cursor: pointer; }
+  #hot:hover { background: #ffe7a3; }
+  #out { color: #2f855a; font-weight: bold; }
+  footer { padding: 16px 28px; color: #7a8699; }
+</style>
+</head>
+<body>
+  <header>
+    <h1>loom</h1>
+    <p>weft, in a window you can browse.</p>
+  </header>
+  <main>
+    <div class="card">
+      <h2>v0 — a live render, blitted to SDL</h2>
+      <p>This page was fetched, parsed, cascaded, laid out and painted by weft to
+      an RGB8 canvas, then blitted into an SDL texture. Resize the window to
+      re-lay it out; scroll with the mouse wheel.</p>
+    </div>
+    <div class="card">
+      <h2>v1 — navigation</h2>
+      <p>Click a link to browse: <a href="about.html">the about page</a>. The URL
+      resolves against this page's base, weft fetches it, and a fresh scripted
+      context renders it.</p>
+    </div>
+    <div class="card">
+      <h2>v2 — live JavaScript</h2>
+      <p>Click the button — its handler mutates the DOM and loom re-renders:</p>
+      <p><button id="go">Click me</button> &nbsp; <span id="out">(no clicks yet)</span></p>
+      <p>Hover <span id="hot">this chip</span> — its <code>mouseover</code>
+      handler reacts (and the CSS cursor turns to a pointer).</p>
+      <p>A <code>setTimeout</code>-driven counter, pumped every frame:
+      <span id="tick">0</span></p>
+    </div>
+  </main>
+  <footer>loom · MIT · pure-CL engine, FFI only in the shell</footer>
+  <script>
+    var n = 0;
+    document.getElementById('go').addEventListener('click', function () {
+      n = n + 1;
+      document.getElementById('out').textContent =
+        n === 1 ? '1 click' : (n + ' clicks');
+    });
+    var hot = document.getElementById('hot');
+    hot.addEventListener('mouseover', function () { hot.textContent = 'hovered!'; });
+    hot.addEventListener('mouseout',  function () { hot.textContent = 'this chip'; });
+    var t = 0;
+    function step() {
+      t = t + 1;
+      document.getElementById('tick').textContent = String(t);
+      setTimeout(step, 1000);
+    }
+    setTimeout(step, 1000);
+  </script>
+</body>
+</html>
