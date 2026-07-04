@@ -22,6 +22,7 @@
   (title "loom")
   (url nil)                             ; this page's own URL (for link resolution)
   (loader nil)
+  (image-loader nil)                    ; (url) -> (values bytes mime) for network <img>
   (on-navigate nil))                    ; (page absolute-url) -> t : the shell follows a link
 
 ;;; ---------------------------------------------------------------------------
@@ -33,14 +34,15 @@
     (and el (let ((tx (dom:text-content el)))
               (and (plusp (length (string-trim '(#\Space #\Tab #\Newline #\Return) tx))) tx)))))
 
-(defun load-page (html &key (css "") (base "") (width 1024) (viewport-height 768) url loader)
+(defun load-page (html &key (css "") (base "") (width 1024) (viewport-height 768) url loader image-loader)
   "Parse HTML, build a fresh scripting context, run inline <script> and drain the
    initial timer/microtask queue, then render.  Returns a live PAGE."
   (let* ((doc (h:parse-html html))
          (ctx (ws:make-context doc :css css :width width :base base :loader loader))
          (pg (make-page :html html :css (or css "") :base base :doc doc :ctx ctx
                         :width width :viewport-height viewport-height
-                        :url url :loader loader)))
+                        :url url :loader loader
+                        :image-loader (or image-loader (make-image-loader base)))))
     (ws:run-inline-scripts ctx)
     (ws:pump-timers ctx 0)          ; settle 0-delay tasks/microtasks; future timers wait
     (ws:fire-lifecycle-events ctx)  ; DOMContentLoaded + load, so on-ready code runs
@@ -71,6 +73,20 @@
               (values nil nil)))
       (error () (values nil nil)))))
 
+(defun make-image-loader (base)
+  "An (url) -> (values bytes mime) network <img> fetcher over seal, resolving
+   relative and protocol-relative URLs against BASE."
+  (lambda (url)
+    (handler-case
+        (let ((abs (cond ((and (>= (length url) 2) (string= (subseq url 0 2) "//"))
+                          (concatenate 'string "https:" url))
+                         (t (or (resolve-url url base) url)))))
+          (let ((resp (fetch:fetch abs)))
+            (when (and resp (<= 200 (fetch:response-status resp) 299))
+              (values (fetch:response-body resp)
+                      (fetch:get-header (fetch:response-headers resp) "content-type")))))
+      (error () (values nil nil)))))
+
 (defun load-url (url-string &key (width 1024) (viewport-height 768))
   "Fetch and load URL-STRING as a fresh page (the network browsing entry)."
   (multiple-value-bind (text charset resp) (fetch:fetch-text url-string)
@@ -96,7 +112,8 @@
    Refreshes the canvas, box tree, styles and content height, and re-clamps the
    scroll position."
   (multiple-value-bind (cv root styles)
-      (r:render-document (page-doc pg) :width (page-width pg) :css (page-css pg))
+      (let ((r:*image-loader* (page-image-loader pg)))   ; network <img> over seal, cached
+        (r:render-document (page-doc pg) :width (page-width pg) :css (page-css pg)))
     (setf (page-canvas pg) cv
           (page-root pg) root
           (page-styles pg) styles
