@@ -43,6 +43,7 @@
                         :url url :loader loader)))
     (ws:run-inline-scripts ctx)
     (ws:pump-timers ctx 0)          ; settle 0-delay tasks/microtasks; future timers wait
+    (ws:fire-lifecycle-events ctx)  ; DOMContentLoaded + load, so on-ready code runs
     (render-page pg)
     (setf (page-title pg) (or (document-title doc) url "loom"))
     pg))
@@ -62,7 +63,9 @@
         (let ((abs (or (resolve-url u base) u)))
           (if (or (url-prefix-p "http:" abs) (url-prefix-p "https:" abs))
               (values (cond ((url-suffix-p ".css" abs) :css)
-                            ((url-suffix-p ".js" abs) :js)
+                            ((or (url-suffix-p ".js" abs)
+                                 (search "only=scripts" abs))   ; MediaWiki load.php
+                             :js)
                             (t :text))
                       (fetch:fetch-text abs))
               (values nil nil)))
