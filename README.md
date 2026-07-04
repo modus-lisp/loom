@@ -48,10 +48,10 @@ brew install sdl2                     # the SDL2 native library
 #   ln -s /path/to/loom ~/quicklisp/local-projects/loom
 #   ln -s /path/to/weft ~/quicklisp/local-projects/weft   (and scribe/shuttle/gesso/stencil)
 
-sbcl --eval '(ql:quickload :loom)' \
+sbcl --control-stack-size 256 --dynamic-space-size 4096 --eval '(ql:quickload :loom)' \
      --eval '(loom:run)'                                   # the bundled home page
 # or a URL / local file:
-sbcl --eval '(ql:quickload :loom)' \
+sbcl --control-stack-size 256 --dynamic-space-size 4096 --eval '(ql:quickload :loom)' \
      --eval '(loom:run :start "https://example.com")'
 ```
 
