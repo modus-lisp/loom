@@ -22,6 +22,46 @@
 (defvar *status* "type a URL and press Go")
 (defvar *gen* 0 "Bumped every render so the client's <img> cache-busts.")
 
+;;; ---- error log (system libsqlite3 over sb-alien; no schema of our own) -----
+(ignore-errors (sb-alien:load-shared-object "libsqlite3.so.0"))
+(sb-alien:define-alien-routine ("sqlite3_open" %sqlite-open) sb-alien:int
+  (filename sb-alien:c-string) (ppdb (* sb-alien:system-area-pointer)))
+(sb-alien:define-alien-routine ("sqlite3_exec" %sqlite-exec) sb-alien:int
+  (db sb-alien:system-area-pointer) (sql sb-alien:c-string)
+  (cb sb-alien:system-area-pointer) (arg sb-alien:system-area-pointer)
+  (errmsg sb-alien:system-area-pointer))
+
+(defvar *errdb* nil "libsqlite3 handle (a SAP), or NIL if logging is unavailable.")
+(defun %nsap () (sb-sys:int-sap 0))
+(defun errlog-exec (sql)
+  (when *errdb* (ignore-errors (%sqlite-exec *errdb* sql (%nsap) (%nsap) (%nsap)))))
+
+(defun errlog-open (path)
+  "Open (creating) the sqlite error log at PATH and ensure the table exists."
+  (handler-case
+      (sb-alien:with-alien ((h sb-alien:system-area-pointer))
+        (when (zerop (%sqlite-open (namestring path) (sb-alien:addr h)))
+          (setf *errdb* h)
+          (errlog-exec "CREATE TABLE IF NOT EXISTS errors (id INTEGER PRIMARY KEY,
+                        ts TEXT DEFAULT CURRENT_TIMESTAMP, kind TEXT, url TEXT, detail TEXT)")
+          (format t "~&error log: ~a~%" (namestring path))))
+    (error (e) (format t "~&error log unavailable (~a)~%" e))))
+
+(defun %sqlq (s)
+  "Single-quote S as a SQL string literal (doubling embedded quotes)."
+  (with-output-to-string (o)
+    (write-char #\' o)
+    (loop for c across (or s "") do (when (char= c #\') (write-char #\' o)) (write-char c o))
+    (write-char #\' o)))
+
+(defun log-error (kind url detail)
+  "Record one error row.  Never signals — logging must not break a request."
+  (ignore-errors
+    (format *error-output* "~&[errlog] ~a ~a: ~a~%" kind (or url "") detail)
+    (errlog-exec (format nil "INSERT INTO errors (kind,url,detail) VALUES (~a,~a,~a)"
+                         (%sqlq (string kind)) (%sqlq (or url ""))
+                         (%sqlq (princ-to-string detail))))))
+
 ;;; ---- browsing -------------------------------------------------------------
 (defun follow (target)
   "on-navigate callback: load TARGET as the new page (keeps the callback)."
@@ -37,7 +77,9 @@
         (setf *page* pg
               *status* (format nil "~a  —  ~a" (or (l:page-title pg) "") (or (l:page-url pg) url)))
         (incf *gen*))
-    (error (e) (setf *status* (format nil "couldn't load ~a  (~a)" url e)))))
+    (error (e)
+      (log-error "navigate" url e)
+      (setf *status* (format nil "couldn't load ~a  (~a)" url e)))))
 
 (defun page-png-bytes ()
   "Encode the current page canvas to PNG bytes (via a temp file)."
@@ -152,7 +194,12 @@ v.onclick=function(e){var r=v.getBoundingClientRect();
        (send stream "200 OK" "text/html; charset=utf-8" (client-html)))
       (t (send stream "404 Not Found" "text/plain" "not found")))))
 
+(defparameter *errlog-path*
+  (merge-pathnames "loom-errors.db"
+                   (uiop:pathname-parent-directory-pathname (directory-namestring *load-truename*))))
+
 (defun serve (&optional (port 8080))
+  (errlog-open *errlog-path*)
   (let ((s (make-instance 'sock:inet-socket :type :stream :protocol :tcp)))
     (setf (sock:sockopt-reuse-address s) t)
     (sock:socket-bind s #(0 0 0 0) port)
@@ -169,11 +216,11 @@ v.onclick=function(e){var r=v.getBoundingClientRect();
                     (let ((stream (sock:socket-make-stream c :element-type '(unsigned-byte 8)
                                                              :input t :output t)))
                       (handler-case (handle stream)
-                        (serious-condition (e) (format t "~&[req] ~a~%" e)))
+                        (serious-condition (e) (format t "~&[req] ~a~%" e) (log-error "request" nil e)))
                       (ignore-errors (finish-output stream))
                       (ignore-errors (close stream)))
                   (ignore-errors (sock:socket-close c))))
-            (serious-condition (e) (format t "~&[accept] ~a~%" e))))
+            (serious-condition (e) (format t "~&[accept] ~a~%" e) (log-error "accept" nil e))))
       (ignore-errors (sock:socket-close s)))))
 
 (let ((port (or (loop for a in (rest sb-ext:*posix-argv*)
