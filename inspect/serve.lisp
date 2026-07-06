@@ -161,14 +161,20 @@ v.onclick=function(e){var r=v.getBoundingClientRect();
     (finish-output)
     (unwind-protect
         (loop
-          (let ((c (sock:socket-accept s)))
-            (let ((stream (sock:socket-make-stream c :element-type '(unsigned-byte 8)
-                                                     :input t :output t)))
-              (handler-case (handle stream)
-                (error (e) (format t "~&[req] ~a~%" e)))
-              (ignore-errors (close stream)))
-            (ignore-errors (sock:socket-close c))))
-      (sock:socket-close s))))
+          ;; Nothing a single connection does (reset, malformed request, a render
+          ;; that throws) may take the server down — wrap the whole accept/serve/close.
+          (handler-case
+              (let ((c (sock:socket-accept s)))
+                (unwind-protect
+                    (let ((stream (sock:socket-make-stream c :element-type '(unsigned-byte 8)
+                                                             :input t :output t)))
+                      (handler-case (handle stream)
+                        (serious-condition (e) (format t "~&[req] ~a~%" e)))
+                      (ignore-errors (finish-output stream))
+                      (ignore-errors (close stream)))
+                  (ignore-errors (sock:socket-close c))))
+            (serious-condition (e) (format t "~&[accept] ~a~%" e))))
+      (ignore-errors (sock:socket-close s)))))
 
 (let ((port (or (loop for a in (rest sb-ext:*posix-argv*)
                       for n = (ignore-errors (parse-integer a))
