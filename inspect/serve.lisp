@@ -77,6 +77,8 @@
                     (l:load-url (concatenate 'string "https://" url)
                                 :width *render-width* :viewport-height 100000))))
         (setf (l:page-on-navigate pg) (lambda (p tgt) (declare (ignore p)) (follow tgt)))
+        ;; the page rendered, but record a non-fatal script error for observability
+        (when (l:page-js-error pg) (log-error "script" url (l:page-js-error pg)))
         (setf *page* pg
               *status* (format nil "~a  —  ~a" (or (l:page-title pg) "") (or (l:page-url pg) url)))
         (incf *gen*))
