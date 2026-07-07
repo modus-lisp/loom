@@ -157,19 +157,44 @@ v.onclick=function(e){var r=v.getBoundingClientRect();
         when (and eq (string= (subseq pair 0 eq) name))
           return (url-decode (subseq pair (1+ eq)))))
 
+(defvar *accept-enc* "" "The current request's Accept-Encoding.")
+
+(defun maybe-compress (bytes)
+  "zstd-compress BYTES when it's worth it and the client accepts zstd — the raster PNGs
+are uncompressed RGB, so this cuts a multi-MB page to a few hundred KB (~20x) in <1s.
+Returns (values out encoding-or-nil)."
+  (if (and (> (length bytes) 32768) (search "zstd" *accept-enc*))
+      (handler-case (values (zstd-pure:compress bytes) "zstd")
+        (error () (values bytes nil)))
+      (values bytes nil)))
+
 (defun send (stream status ctype body &key location)
-  (let* ((bytes (if (stringp body) (sb-ext:string-to-octets body :external-format :utf-8) body))
-         (h (with-output-to-string (o)
-              (format o "HTTP/1.1 ~a~a" status +crlf+)
-              (when location (format o "Location: ~a~a" location +crlf+))
-              (format o "Content-Type: ~a~aContent-Length: ~a~aConnection: close~a~a"
-                      ctype +crlf+ (length bytes) +crlf+ +crlf+ +crlf+))))
-    (write-sequence (sb-ext:string-to-octets h :external-format :latin-1) stream)
-    (write-sequence bytes stream)
-    (finish-output stream)))
+  (let ((raw (if (stringp body) (sb-ext:string-to-octets body :external-format :utf-8) body)))
+    (multiple-value-bind (bytes enc) (maybe-compress raw)
+      (let ((h (with-output-to-string (o)
+                 (format o "HTTP/1.1 ~a~a" status +crlf+)
+                 (when location (format o "Location: ~a~a" location +crlf+))
+                 (when enc (format o "Content-Encoding: ~a~a" enc +crlf+))
+                 (format o "Content-Type: ~a~aContent-Length: ~a~aConnection: close~a~a"
+                         ctype +crlf+ (length bytes) +crlf+ +crlf+ +crlf+))))
+        (write-sequence (sb-ext:string-to-octets h :external-format :latin-1) stream)
+        (write-sequence bytes stream)
+        (finish-output stream)))))
+
+(defun header-value (head name)
+  "Value of the NAME header (case-insensitive) in the raw request HEAD, or \"\"."
+  (let* ((lower (string-downcase head))
+         (key (concatenate 'string (string-downcase name) ":"))
+         (p (search key lower)))
+    (if p
+        (let* ((start (+ p (length key)))
+               (end (or (search +crlf+ head :start2 start) (length head))))
+          (string-trim " " (subseq head start end)))
+        "")))
 
 (defun handle (stream)
   (let* ((head (read-head stream))
+         (*accept-enc* (header-value head "accept-encoding"))
          (line (subseq head 0 (or (search +crlf+ head) (length head))))
          (parts (uiop:split-string line :separator " "))
          (target (or (second parts) "/"))
