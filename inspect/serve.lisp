@@ -113,8 +113,8 @@
 #bar{position:sticky;top:0;background:#333;padding:6px;display:flex;gap:6px;z-index:9}
 #bar input{flex:1;padding:5px;font-size:16px;min-width:0}#bar button{padding:5px 12px}
 #s{padding:4px 8px;color:#9c9;font-size:12px}#v{display:block;width:100%;height:auto;background:#fff}</style></head>
-<body><form id=bar action=\"/go\"><input name=url value=\"~a\" placeholder=\"https://…\">
-<button>Go</button></form><div id=s>~a</div>
+<body><form id=bar action=\"/go\" novalidate><input name=url value=\"~a\" placeholder=\"https://…\" type=\"url\" inputmode=\"url\" autocapitalize=\"none\" autocorrect=\"off\" spellcheck=\"false\">
+<button>Go</button><button formaction=\"/flag\" formnovalidate title=\"flag this page as broken\">&#9873;</button></form><div id=s>~a</div>
 <img id=v src=\"/view.png?g=~a\">
 <script>
 var v=document.getElementById('v');
@@ -236,6 +236,14 @@ Returns (values out encoding-or-nil)."
        (let ((x (ignore-errors (parse-integer (or (query-param query "x") "0"))))
              (y (ignore-errors (parse-integer (or (query-param query "y") "0")))))
          (when (and x y) (handle-click x y)))
+       (send stream "302 Found" "text/plain" "" :location "/"))
+      ((string= path "/flag")
+       ;; record the currently-shown page for later diagnosis — catches renders that are
+       ;; wrong but didn't error (unstyled, missing images), which nothing else logs.
+       (let ((u (or (and *page* (l:page-url *page*)) (query-param query "url"))))
+         (when (and u (plusp (length u)))
+           (log-error "flag" u (format nil "flagged; ~a" *status*))
+           (setf *status* (format nil "flagged for review: ~a" u))))
        (send stream "302 Found" "text/plain" "" :location "/"))
       ((string= path "/")
        (send stream "200 OK" "text/html; charset=utf-8" (client-html)))
