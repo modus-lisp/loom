@@ -34,18 +34,32 @@
     (and el (let ((tx (dom:text-content el)))
               (and (plusp (length (string-trim '(#\Space #\Tab #\Newline #\Return) tx))) tx)))))
 
+(defparameter *js-budget* 2.0
+  "Seconds of wall-clock a page's scripts may run during load before the raster is
+   taken with the DOM as it stands.")
+
 (defun load-page (html &key (css "") (base "") (width 1024) (viewport-height 768) url loader image-loader)
   "Parse HTML, build a fresh scripting context, run inline <script> and drain the
    initial timer/microtask queue, then render.  Returns a live PAGE."
   (let* ((doc (h:parse-html html))
+         ;; prefetch external CSS/JS in parallel before the cascade needs them
+         (loader (if (and loader (plusp (length base)))
+                     (make-prefetching-loader doc base loader)
+                     loader))
          (ctx (ws:make-context doc :css css :width width :base base :loader loader))
          (pg (make-page :html html :css (or css "") :base base :doc doc :ctx ctx
                         :width width :viewport-height viewport-height
                         :url url :loader loader
                         :image-loader (or image-loader (make-image-loader base)))))
-    (ws:run-inline-scripts ctx)
-    (ws:pump-timers ctx 0)          ; settle 0-delay tasks/microtasks; future timers wait
-    (ws:fire-lifecycle-events ctx)  ; DOMContentLoaded + load, so on-ready code runs
+    ;; Run the page's scripts under a wall-clock budget: a raster view doesn't need a
+    ;; fully-settled JS app, and some pages spin for seconds.  On timeout we render the
+    ;; DOM as it stands.
+    (handler-case
+        (sb-ext:with-timeout *js-budget*
+          (ws:run-inline-scripts ctx)
+          (ws:pump-timers ctx 0)          ; settle 0-delay tasks/microtasks; future timers wait
+          (ws:fire-lifecycle-events ctx)) ; DOMContentLoaded + load, so on-ready code runs
+      (sb-ext:timeout () nil))
     (render-page pg)
     (setf (page-title pg) (or (document-title doc) url "loom"))
     pg))
@@ -72,6 +86,59 @@
                       (fetch:fetch-text abs))
               (values nil nil)))
       (error () (values nil nil)))))
+
+(defun subresource-kind (abs)
+  (cond ((url-suffix-p ".css" abs) :css)
+        ((or (url-suffix-p ".js" abs) (search "only=scripts" abs)) :js)
+        (t :text)))
+
+(defun subresource-urls (doc base)
+  "Absolute http(s) URLs of external stylesheets and scripts declared in DOC."
+  (let ((urls '()))
+    (labels ((add (attr node)
+               (let ((v (dom:get-attribute node attr)))
+                 (when (and v (plusp (length v)))
+                   (let ((abs (or (resolve-url v base) v)))
+                     (when (and abs (or (url-prefix-p "http:" abs) (url-prefix-p "https:" abs)))
+                       (push abs urls)))))))
+      (dolist (n (css:query-select-all doc "link[rel=stylesheet]")) (add "href" n))
+      (dolist (n (css:query-select-all doc "script[src]")) (add "src" n)))
+    (remove-duplicates (nreverse urls) :test #'string=)))
+
+(defparameter *max-concurrent-fetches* 12
+  "Cap on simultaneous subresource connections during a parallel prefetch.")
+
+(defun parallel-fetch (urls)
+  "Fetch URLS concurrently over seal (each its own connection), at most
+   *MAX-CONCURRENT-FETCHES* at a time; return a hash-table abs-url -> text (NIL on
+   failure)."
+  (let ((cache (make-hash-table :test 'equal))
+        (lock (sb-thread:make-mutex))
+        (sem (sb-thread:make-semaphore :count *max-concurrent-fetches*)))
+    (let ((threads (mapcar (lambda (u)
+                             (sb-thread:make-thread
+                              (lambda ()
+                                (sb-thread:wait-on-semaphore sem)
+                                (unwind-protect
+                                    (let ((text (handler-case (fetch:fetch-text u) (error () nil))))
+                                      (sb-thread:with-mutex (lock) (setf (gethash u cache) text)))
+                                  (sb-thread:signal-semaphore sem)))
+                              :name "prefetch"))
+                           urls)))
+      (dolist (th threads) (ignore-errors (sb-thread:join-thread th))))
+    cache))
+
+(defun make-prefetching-loader (doc base fallback)
+  "Fetch every external stylesheet/script in DOC concurrently up front, then serve them
+   from that cache — turning N serial TLS fetches into one parallel batch.  Anything not
+   prefetched (dynamic, data:, script-added) falls through to FALLBACK."
+  (let ((cache (parallel-fetch (subresource-urls doc base))))
+    (lambda (ctx u)
+      (let ((abs (or (resolve-url u base) u)))
+        (multiple-value-bind (text present) (gethash abs cache)
+          (if (and present text)
+              (values (subresource-kind abs) text)
+              (funcall fallback ctx u)))))))
 
 (defun make-image-loader (base)
   "An (url) -> (values bytes mime) network <img> fetcher over seal, resolving
