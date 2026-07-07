@@ -78,19 +78,17 @@
     (handler-case
         (let ((abs (or (resolve-url u base) u)))
           (if (or (url-prefix-p "http:" abs) (url-prefix-p "https:" abs))
-              (values (cond ((url-suffix-p ".css" abs) :css)
-                            ((or (url-suffix-p ".js" abs)
-                                 (search "only=scripts" abs))   ; MediaWiki load.php
-                             :js)
-                            (t :text))
-                      (fetch:fetch-text abs))
+              (values (subresource-kind abs) (fetch:fetch-text abs))
               (values nil nil)))
       (error () (values nil nil)))))
 
 (defun subresource-kind (abs)
-  (cond ((url-suffix-p ".css" abs) :css)
-        ((or (url-suffix-p ".js" abs) (search "only=scripts" abs)) :js)
-        (t :text)))
+  ;; test the extension on the path, not the whole URL — a query string (news.css?hash)
+  ;; hides the suffix otherwise.
+  (let ((path (subseq abs 0 (or (position #\? abs) (length abs)))))
+    (cond ((url-suffix-p ".css" path) :css)
+          ((or (url-suffix-p ".js" path) (search "only=scripts" abs)) :js)
+          (t :text))))
 
 (defun subresource-urls (doc base)
   "Absolute http(s) URLs of external stylesheets and scripts declared in DOC."
