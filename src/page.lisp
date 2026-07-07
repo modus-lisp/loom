@@ -23,6 +23,7 @@
   (url nil)                             ; this page's own URL (for link resolution)
   (loader nil)
   (image-loader nil)                    ; (url) -> (values bytes mime) for network <img>
+  (js-error nil)                        ; message of a script error that didn't stop the render
   (on-navigate nil))                    ; (page absolute-url) -> t : the shell follows a link
 
 ;;; ---------------------------------------------------------------------------
@@ -52,14 +53,17 @@
                         :url url :loader loader
                         :image-loader (or image-loader (make-image-loader base)))))
     ;; Run the page's scripts under a wall-clock budget: a raster view doesn't need a
-    ;; fully-settled JS app, and some pages spin for seconds.  On timeout we render the
-    ;; DOM as it stands.
+    ;; fully-settled JS app, and some pages spin for seconds.  On timeout — or an
+    ;; uncaught script error — we render the DOM as it stands rather than blank the page
+    ;; (a real browser reports the error and paints anyway); the error is kept on the
+    ;; page for the caller to surface/log.
     (handler-case
         (sb-ext:with-timeout *js-budget*
           (ws:run-inline-scripts ctx)
           (ws:pump-timers ctx 0)          ; settle 0-delay tasks/microtasks; future timers wait
           (ws:fire-lifecycle-events ctx)) ; DOMContentLoaded + load, so on-ready code runs
-      (sb-ext:timeout () nil))
+      (sb-ext:timeout () (setf (page-js-error pg) "script budget exceeded"))
+      (error (e) (setf (page-js-error pg) (princ-to-string e))))
     (render-page pg)
     (setf (page-title pg) (or (document-title doc) url "loom"))
     pg))
