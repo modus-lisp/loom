@@ -21,6 +21,9 @@
 (defvar *page* nil "The single live browsing session (MVP: one shared page).")
 (defvar *status* "type a URL and press Go")
 (defvar *gen* 0 "Bumped every render so the client's <img> cache-busts.")
+(defvar *render-width* 1024
+  "Layout width pages are rendered at — driven by the client's viewport width (a `vw`
+   cookie) so mobile gets a readable device-width render instead of a shrunk 1024px page.")
 
 ;;; ---- error log (system libsqlite3 over sb-alien; no schema of our own) -----
 (ignore-errors (sb-alien:load-shared-object "libsqlite3.so.0"))
@@ -70,9 +73,9 @@
 (defun navigate (url)
   (handler-case
       (let ((pg (if (or (search "://" url) (eql 0 (search "http" url)))
-                    (l:load-url url :width 1024 :viewport-height 100000)
+                    (l:load-url url :width *render-width* :viewport-height 100000)
                     (l:load-url (concatenate 'string "https://" url)
-                                :width 1024 :viewport-height 100000))))
+                                :width *render-width* :viewport-height 100000))))
         (setf (l:page-on-navigate pg) (lambda (p tgt) (declare (ignore p)) (follow tgt)))
         (setf *page* pg
               *status* (format nil "~a  —  ~a" (or (l:page-title pg) "") (or (l:page-url pg) url)))
@@ -102,19 +105,25 @@
 (defun client-html ()
   (let ((h (if *page* (r:canvas-height (l:page-canvas *page*)) 0)))
     (format nil "<!doctype html><html><head><meta charset=\"utf-8\"><title>weft</title>
+<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">
+<script>document.cookie='vw='+Math.round(window.innerWidth)+';path=/;max-age=31536000';</script>
 <style>body{margin:0;font:14px sans-serif;background:#222;color:#eee}
 #bar{position:sticky;top:0;background:#333;padding:6px;display:flex;gap:6px;z-index:9}
-#bar input{flex:1;padding:5px;font-size:14px}#bar button{padding:5px 12px}
-#s{padding:4px 8px;color:#9c9;font-size:12px}#v{display:block;background:#fff}</style></head>
-<body><form id=bar action=\"/go\"><input name=url value=\"~a\" placeholder=\"https://…\" autofocus>
+#bar input{flex:1;padding:5px;font-size:16px;min-width:0}#bar button{padding:5px 12px}
+#s{padding:4px 8px;color:#9c9;font-size:12px}#v{display:block;width:100%;height:auto;background:#fff}</style></head>
+<body><form id=bar action=\"/go\"><input name=url value=\"~a\" placeholder=\"https://…\">
 <button>Go</button></form><div id=s>~a</div>
-<img id=v src=\"/view.png?g=~a\" width=\"1024\">
+<img id=v src=\"/view.png?g=~a\">
 <script>
 var v=document.getElementById('v');
-v.onclick=function(e){var r=v.getBoundingClientRect();
- var sx=v.naturalWidth/r.width, sy=v.naturalHeight/r.height;
- var x=Math.round((e.clientX-r.left)*sx), y=Math.round((e.clientY-r.top)*sy);
- location='/click?x='+x+'&y='+y;};
+// Map a tap to raster (page) coordinates: getBoundingClientRect and clientX are both in
+// layout-viewport CSS px, so naturalWidth/rect.width scales correctly even under pinch-zoom.
+v.onclick=function(e){
+  var r=v.getBoundingClientRect();
+  var x=Math.round((e.clientX-r.left)*(v.naturalWidth/r.width));
+  var y=Math.round((e.clientY-r.top)*(v.naturalHeight/r.height));
+  location='/click?x='+x+'&y='+y;
+};
 </script></body></html>"
             (%esc (or (and *page* (l:page-url *page*)) "")) (%esc *status*) *gen* h)))
 
@@ -192,6 +201,16 @@ Returns (values out encoding-or-nil)."
           (string-trim " " (subseq head start end)))
         "")))
 
+(defun apply-viewport-width (head)
+  "Adopt the client's viewport width (the `vw` cookie), relaying out the current page
+   if it changed — so mobile gets a device-width render instead of a shrunk 1024px page."
+  (let* ((cookie (header-value head "cookie"))
+         (p (search "vw=" cookie))
+         (vw (and p (ignore-errors (parse-integer cookie :start (+ p 3) :junk-allowed t)))))
+    (when (and vw (<= 280 vw 2400) (/= vw *render-width*))
+      (setf *render-width* vw)
+      (when *page* (ignore-errors (l:relayout *page* *render-width*) (incf *gen*))))))
+
 (defun handle (stream)
   (let* ((head (read-head stream))
          (*accept-enc* (header-value head "accept-encoding"))
@@ -201,6 +220,7 @@ Returns (values out encoding-or-nil)."
          (qpos (position #\? target))
          (path (if qpos (subseq target 0 qpos) target))
          (query (and qpos (subseq target (1+ qpos)))))
+    (apply-viewport-width head)
     (cond
       ((string= path "/view.png")
        (let ((png (page-png-bytes)))
