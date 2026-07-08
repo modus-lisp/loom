@@ -93,6 +93,10 @@
     (coerce (r:canvas->png (l:page-canvas *page*))
             '(simple-array (unsigned-byte 8) (*)))))
 
+(defun state-text ()
+  "The client-facing page state: current URL on the first line, status on the second."
+  (format nil "~a~%~a" (or (and *page* (l:page-url *page*)) "") (or *status* "")))
+
 (defun handle-click (x y)
   "Route a viewport click at (X,Y) — the raster is the full page, scroll-y stays 0,
    so image coords are page coords.  mouse-release follows links + fires DOM click."
@@ -103,29 +107,53 @@
 
 ;;; ---- the client -----------------------------------------------------------
 (defun client-html ()
-  (let ((h (if *page* (r:canvas-height (l:page-canvas *page*)) 0)))
-    (format nil "<!doctype html><html><head><meta charset=\"utf-8\"><title>weft</title>
+  ;; Navigation is driven by the URL hash so the browser Back/Forward buttons work:
+  ;; the address bar and link clicks set location.hash, and a hashchange handler (which
+  ;; also fires on Back/Forward) renders that URL.  The raster/status are fetched, not
+  ;; embedded, so a hash change is one history entry without a full page reload.
+  (format nil "<!doctype html><html><head><meta charset=\"utf-8\"><title>weft</title>
 <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">
 <script>document.cookie='vw='+Math.round(window.innerWidth)+';path=/;max-age=31536000';</script>
 <style>body{margin:0;font:14px sans-serif;background:#222;color:#eee}
 #bar{position:sticky;top:0;background:#333;padding:6px;display:flex;gap:6px;z-index:9}
 #bar input{flex:1;padding:5px;font-size:16px;min-width:0}#bar button{padding:5px 12px}
 #s{padding:4px 8px;color:#9c9;font-size:12px}#v{display:block;width:100%;height:auto;background:#fff}</style></head>
-<body><form id=bar action=\"/go\" novalidate><input name=url value=\"~a\" placeholder=\"https://…\" type=\"url\" inputmode=\"url\" autocapitalize=\"none\" autocorrect=\"off\" spellcheck=\"false\">
-<button>Go</button><button formaction=\"/flag\" formnovalidate title=\"flag this page as broken\">&#9873;</button></form><div id=s>~a</div>
-<img id=v src=\"/view.png?g=~a\">
+<body><form id=bar novalidate><input id=u placeholder=\"https://…\" type=\"url\" inputmode=\"url\" autocapitalize=\"none\" autocorrect=\"off\" spellcheck=\"false\">
+<button type=submit>Go</button><button type=button id=flag title=\"flag this page as broken\">&#9873;</button></form><div id=s></div>
+<img id=v>
 <script>
-var v=document.getElementById('v');
-// Map a tap to raster (page) coordinates: getBoundingClientRect and clientX are both in
-// layout-viewport CSS px, so naturalWidth/rect.width scales correctly even under pinch-zoom.
+var v=document.getElementById('v'),u=document.getElementById('u'),s=document.getElementById('s');
+var serverUrl='~a';                 // the URL the server currently has rendered
+u.value=serverUrl; s.textContent='~a';
+function hurl(){return decodeURIComponent(location.hash.slice(1));}
+function reimg(){v.src='/view.png?g='+Date.now();}
+function apply(t){var i=t.indexOf('\\n');var url=i<0?t:t.slice(0,i);serverUrl=url;if(url)u.value=url;s.textContent=i<0?'':t.slice(i+1);reimg();}
+function render(){var h=hurl();if(!h)return;u.value=h;if(h===serverUrl){reimg();return;}fetch('/go?url='+encodeURIComponent(h)).then(function(r){return r.text();}).then(apply);}
+window.addEventListener('hashchange',render);
+document.getElementById('bar').onsubmit=function(e){e.preventDefault();var t=u.value.trim();if(!t)return;var enc=encodeURIComponent(t);if(location.hash.slice(1)===enc)render();else location.hash=enc;};
+document.getElementById('flag').onclick=function(){fetch('/flag').then(function(r){return r.text();}).then(function(t){s.textContent=t;});};
 v.onclick=function(e){
   var r=v.getBoundingClientRect();
   var x=Math.round((e.clientX-r.left)*(v.naturalWidth/r.width));
   var y=Math.round((e.clientY-r.top)*(v.naturalHeight/r.height));
-  location='/click?x='+x+'&y='+y;
+  fetch('/click?x='+x+'&y='+y).then(function(r){return r.text();}).then(function(t){
+    var i=t.indexOf('\\n');var url=i<0?t:t.slice(0,i);
+    if(url&&url!==serverUrl){apply(t);var enc=encodeURIComponent(url);if(location.hash.slice(1)!==enc)location.hash=enc;}
+    else reimg();
+  });
 };
+if(hurl())render(); else if(serverUrl){reimg();location.hash=encodeURIComponent(serverUrl);}
 </script></body></html>"
-            (%esc (or (and *page* (l:page-url *page*)) "")) (%esc *status*) *gen* h)))
+            (%jsesc (or (and *page* (l:page-url *page*)) ""))
+            (%jsesc *status*)))
+
+(defun %jsesc (s)
+  "Escape S for a single-quoted JavaScript string literal."
+  (with-output-to-string (o)
+    (loop for c across (or s "") do
+      (case c (#\' (write-string "\\'" o)) (#\\ (write-string "\\\\" o))
+              (#\Newline (write-string "\\n" o)) (#\Return)
+              (t (write-char c o))))))
 
 (defun %esc (s)
   (with-output-to-string (o)
@@ -229,14 +257,17 @@ Returns (values out encoding-or-nil)."
          (if png (send stream "200 OK" "image/png" png)
              (send stream "404 Not Found" "text/plain" "no page"))))
       ((string= path "/go")
+       ;; render URL and return the page state (current-url + status) for the client to
+       ;; reflect into the address bar / status line — the browser history is the hash.
        (let ((url (query-param query "url")))
          (when (and url (plusp (length url))) (navigate url)))
-       (send stream "302 Found" "text/plain" "" :location "/"))
+       (send stream "200 OK" "text/plain; charset=utf-8" (state-text)))
       ((string= path "/click")
        (let ((x (ignore-errors (parse-integer (or (query-param query "x") "0"))))
              (y (ignore-errors (parse-integer (or (query-param query "y") "0")))))
          (when (and x y) (handle-click x y)))
-       (send stream "302 Found" "text/plain" "" :location "/"))
+       ;; a click may follow a link (page-url changes); the client sets the hash to it
+       (send stream "200 OK" "text/plain; charset=utf-8" (state-text)))
       ((string= path "/flag")
        ;; record the currently-shown page for later diagnosis — catches renders that are
        ;; wrong but didn't error (unstyled, missing images), which nothing else logs.
@@ -244,7 +275,7 @@ Returns (values out encoding-or-nil)."
          (when (and u (plusp (length u)))
            (log-error "flag" u (format nil "flagged; ~a" *status*))
            (setf *status* (format nil "flagged for review: ~a" u))))
-       (send stream "302 Found" "text/plain" "" :location "/"))
+       (send stream "200 OK" "text/plain; charset=utf-8" (or *status* "")))
       ((string= path "/")
        (send stream "200 OK" "text/html; charset=utf-8" (client-html)))
       (t (send stream "404 Not Found" "text/plain" "not found")))))
