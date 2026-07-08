@@ -87,13 +87,11 @@
       (setf *status* (format nil "couldn't load ~a  (~a)" url e)))))
 
 (defun page-png-bytes ()
-  "Encode the current page canvas to PNG bytes (via a temp file)."
+  "Encode the current page canvas to PNG bytes in memory — no temp file, so a full
+   disk can't break rendering."
   (when *page*
-    (let ((tmp "/tmp/weft-serve-view.png"))
-      (r:write-png (l:page-canvas *page*) tmp)
-      (with-open-file (in tmp :element-type '(unsigned-byte 8))
-        (let ((b (make-array (file-length in) :element-type '(unsigned-byte 8))))
-          (read-sequence b in) b)))))
+    (coerce (r:canvas->png (l:page-canvas *page*))
+            '(simple-array (unsigned-byte 8) (*)))))
 
 (defun handle-click (x y)
   "Route a viewport click at (X,Y) — the raster is the full page, scroll-y stays 0,
@@ -204,13 +202,15 @@ Returns (values out encoding-or-nil)."
         "")))
 
 (defun apply-viewport-width (head)
-  "Adopt the client's viewport width (the `vw` cookie), relaying out the current page
-   if it changed — so mobile gets a device-width render instead of a shrunk 1024px page."
+  "Render at the requesting client's own viewport width (its `vw` cookie), defaulting to
+   1024 when the cookie is absent so a cookieless request never inherits a prior
+   visitor's width.  Relays out the shared page when the width changes."
   (let* ((cookie (header-value head "cookie"))
          (p (search "vw=" cookie))
-         (vw (and p (ignore-errors (parse-integer cookie :start (+ p 3) :junk-allowed t)))))
-    (when (and vw (<= 280 vw 2400) (/= vw *render-width*))
-      (setf *render-width* vw)
+         (vw (and p (ignore-errors (parse-integer cookie :start (+ p 3) :junk-allowed t))))
+         (desired (if (and vw (<= 280 vw 2400)) vw 1024)))
+    (when (/= desired *render-width*)
+      (setf *render-width* desired)
       (when *page* (ignore-errors (l:relayout *page* *render-width*) (incf *gen*))))))
 
 (defun handle (stream)
