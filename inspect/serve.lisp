@@ -86,12 +86,17 @@
       (log-error "navigate" url e)
       (setf *status* (format nil "couldn't load ~a  (~a)" url e)))))
 
+(defvar *png-cache* nil)
+(defvar *png-cache-gen* -1)
 (defun page-png-bytes ()
-  "Encode the current page canvas to PNG bytes in memory — no temp file, so a full
-   disk can't break rendering."
+  "Encode the current page canvas to a compressed PNG in memory, cached per *GEN* — the
+   DEFLATE encode costs seconds on a tall page, so encode once per navigation, not per
+   /view.png request.  No temp file, so a full disk can't break rendering."
   (when *page*
-    (coerce (r:canvas->png (l:page-canvas *page*))
-            '(simple-array (unsigned-byte 8) (*)))))
+    (unless (and *png-cache* (= *png-cache-gen* *gen*))
+      (setf *png-cache* (coerce (r:canvas->png (l:page-canvas *page*)) '(simple-array (unsigned-byte 8) (*)))
+            *png-cache-gen* *gen*))
+    *png-cache*))
 
 (defun state-text ()
   "The client-facing page state: current URL on the first line, status on the second."
@@ -207,7 +212,9 @@ Returns (values out encoding-or-nil)."
 
 (defun send (stream status ctype body &key location)
   (let ((raw (if (stringp body) (sb-ext:string-to-octets body :external-format :utf-8) body)))
-    (multiple-value-bind (bytes enc) (maybe-compress raw)
+    ;; the PNG is already DEFLATE-compressed; a zstd pass over it barely shrinks it and
+    ;; wastes a second — only compress text/other bodies.
+    (multiple-value-bind (bytes enc) (if (search "image/" ctype) (values raw nil) (maybe-compress raw))
       (let ((h (with-output-to-string (o)
                  (format o "HTTP/1.1 ~a~a" status +crlf+)
                  (when location (format o "Location: ~a~a" location +crlf+))
