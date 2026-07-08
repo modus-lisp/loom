@@ -50,12 +50,149 @@
                   (loop for c across (h:dnode-children node) sum (dom-text-length c))))
     (t (loop for c across (h:dnode-children node) sum (dom-text-length c)))))
 
+;;; ---- MathJax fallback ----------------------------------------------------
+;;; MathJax renders `\(...\)` / `\[...\]` LaTeX via JavaScript we don't run, so the
+;;; raw source (`\(u \leq_F v\)`) would otherwise show as text.  A JS-off browser
+;;; shows the same; a reader can do better by transliterating the common LaTeX to
+;;; Unicode (u ≤_F v) — not typeset math, but legible.  Non-standard, hence in loom.
+
+(defparameter *tex-symbols*
+  (let ((h (make-hash-table :test 'equal)))
+    (dolist (pair '(("\\leq" "≤") ("\\le" "≤") ("\\geq" "≥") ("\\ge" "≥") ("\\neq" "≠") ("\\ne" "≠")
+                    ("\\in" "∈") ("\\notin" "∉") ("\\ni" "∋") ("\\subset" "⊂") ("\\subseteq" "⊆")
+                    ("\\supset" "⊃") ("\\supseteq" "⊇") ("\\cup" "∪") ("\\cap" "∩") ("\\setminus" "∖")
+                    ("\\emptyset" "∅") ("\\varnothing" "∅") ("\\times" "×") ("\\cdot" "⋅") ("\\ast" "∗")
+                    ("\\pm" "±") ("\\mp" "∓") ("\\div" "÷") ("\\star" "⋆") ("\\circ" "∘") ("\\bullet" "•")
+                    ("\\to" "→") ("\\rightarrow" "→") ("\\leftarrow" "←") ("\\Rightarrow" "⇒")
+                    ("\\Leftarrow" "⇐") ("\\Leftrightarrow" "⇔") ("\\leftrightarrow" "↔") ("\\mapsto" "↦")
+                    ("\\uparrow" "↑") ("\\downarrow" "↓") ("\\implies" "⟹") ("\\iff" "⟺")
+                    ("\\forall" "∀") ("\\exists" "∃") ("\\nexists" "∄") ("\\nabla" "∇") ("\\partial" "∂")
+                    ("\\infty" "∞") ("\\sum" "∑") ("\\prod" "∏") ("\\int" "∫") ("\\oint" "∮")
+                    ("\\sqrt" "√") ("\\approx" "≈") ("\\cong" "≅") ("\\equiv" "≡") ("\\sim" "∼")
+                    ("\\simeq" "≃") ("\\propto" "∝") ("\\ll" "≪") ("\\gg" "≫") ("\\prec" "≺") ("\\succ" "≻")
+                    ("\\ldots" "…") ("\\cdots" "⋯") ("\\dots" "…") ("\\vdots" "⋮") ("\\ddots" "⋱")
+                    ("\\land" "∧") ("\\lor" "∨") ("\\lnot" "¬") ("\\neg" "¬") ("\\wedge" "∧") ("\\vee" "∨")
+                    ("\\oplus" "⊕") ("\\otimes" "⊗") ("\\perp" "⊥") ("\\parallel" "∥") ("\\angle" "∠")
+                    ("\\langle" "⟨") ("\\rangle" "⟩") ("\\lceil" "⌈") ("\\rceil" "⌉") ("\\lfloor" "⌊") ("\\rfloor" "⌋")
+                    ("\\mid" "∣") ("\\backslash" "\\") ("\\%" "%") ("\\&" "&") ("\\#" "#") ("\\$" "$")
+                    ("\\alpha" "α") ("\\beta" "β") ("\\gamma" "γ") ("\\delta" "δ") ("\\epsilon" "ε")
+                    ("\\varepsilon" "ε") ("\\zeta" "ζ") ("\\eta" "η") ("\\theta" "θ") ("\\vartheta" "ϑ")
+                    ("\\iota" "ι") ("\\kappa" "κ") ("\\lambda" "λ") ("\\mu" "μ") ("\\nu" "ν") ("\\xi" "ξ")
+                    ("\\pi" "π") ("\\varpi" "ϖ") ("\\rho" "ρ") ("\\sigma" "σ") ("\\tau" "τ") ("\\upsilon" "υ")
+                    ("\\phi" "φ") ("\\varphi" "φ") ("\\chi" "χ") ("\\psi" "ψ") ("\\omega" "ω")
+                    ("\\Gamma" "Γ") ("\\Delta" "Δ") ("\\Theta" "Θ") ("\\Lambda" "Λ") ("\\Xi" "Ξ")
+                    ("\\Pi" "Π") ("\\Sigma" "Σ") ("\\Phi" "Φ") ("\\Psi" "Ψ") ("\\Omega" "Ω")
+                    ("\\mathbb{R}" "ℝ") ("\\mathbb{N}" "ℕ") ("\\mathbb{Z}" "ℤ") ("\\mathbb{Q}" "ℚ")
+                    ("\\mathbb{C}" "ℂ")
+                    ("\\quad" "  ") ("\\qquad" "    ") ("\\left" "") ("\\right" "") ("\\bigl" "") ("\\bigr" "")
+                    ("\\Big" "") ("\\big" "") ("\\displaystyle" "") ("\\textstyle" "") ("\\limits" "")))
+      (setf (gethash (first pair) h) (second pair)))
+    h))
+
+(defparameter *tex-subscripts*
+  (let ((h (make-hash-table)))
+    (loop for c across "0123456789+-=()aehijklmnoprstuvx"
+          for u across "₀₁₂₃₄₅₆₇₈₉₊₋₌₍₎ₐₑₕᵢⱼₖₗₘₙₒₚᵣₛₜᵤᵥₓ"
+          do (setf (gethash c h) u))
+    h))
+
+(defparameter *tex-superscripts*
+  (let ((h (make-hash-table)))
+    (loop for c across "0123456789+-=()abcdefghijklmnoprstuvwxyz"
+          for u across "⁰¹²³⁴⁵⁶⁷⁸⁹⁺⁻⁼⁽⁾ᵃᵇᶜᵈᵉᶠᵍʰⁱʲᵏˡᵐⁿᵒᵖʳˢᵗᵘᵛʷˣʸᶻ"
+          do (setf (gethash c h) u))
+    h))
+
+(defun %tex-script-arg (s i)
+  "Read a sub/superscript argument at index I: a {group} or one char.  (values text new-i)."
+  (let ((n (length s)))
+    (cond ((>= i n) (values "" i))
+          ((char= (char s i) #\{)
+           (let ((j (1+ i)) (depth 1))
+             (loop while (and (< j n) (> depth 0))
+                   do (case (char s j) (#\{ (incf depth)) (#\} (decf depth))) (incf j))
+             (values (subseq s (1+ i) (max (1+ i) (1- j))) j)))
+          (t (values (string (char s i)) (1+ i))))))
+
+(defun tex->unicode (s)
+  "Transliterate a LaTeX math fragment S to a Unicode approximation."
+  (with-output-to-string (out)
+    (let ((i 0) (n (length s)))
+      (loop while (< i n) do
+        (let ((c (char s i)))
+          (cond
+            ((char= c #\\)
+             (cond
+               ;; \mathbb{R} etc. — a 10-char token including the braced letter
+               ((and (<= (+ i 10) n) (gethash (subseq s i (+ i 10)) *tex-symbols*))
+                (write-string (gethash (subseq s i (+ i 10)) *tex-symbols*) out) (setf i (+ i 10)))
+               ((and (< (1+ i) n) (alpha-char-p (char s (1+ i))))
+                (let ((j (1+ i)))
+                  (loop while (and (< j n) (alpha-char-p (char s j))) do (incf j))
+                  (let ((rep (gethash (subseq s i j) *tex-symbols*)))
+                    (write-string (or rep (subseq s (1+ i) j)) out)   ; unknown: keep the name
+                    (when (and (< j n) (char= (char s j) #\Space)) (incf j))
+                    (setf i j))))
+               (t (let ((d (if (< (1+ i) n) (char s (1+ i)) #\Space)))
+                    (case d ((#\, #\; #\: #\Space) (write-char #\Space out))
+                            ((#\{ #\} #\% #\& #\# #\$ #\_ #\^) (write-char d out))
+                            (t nil))                                  ; \( \) \[ \] \! -> drop
+                    (setf i (+ i 2))))))
+            ((char= c #\_)
+             (multiple-value-bind (txt j) (%tex-script-arg s (1+ i))
+               (let ((u (tex->unicode txt)))
+                 (write-string (if (and (= (length u) 1) (gethash (char u 0) *tex-subscripts*))
+                                   (string (gethash (char u 0) *tex-subscripts*))
+                                   (concatenate 'string "_" u))
+                               out))
+               (setf i j)))
+            ((char= c #\^)
+             (multiple-value-bind (txt j) (%tex-script-arg s (1+ i))
+               (let ((u (tex->unicode txt)))
+                 (write-string (if (and (= (length u) 1) (gethash (char u 0) *tex-superscripts*))
+                                   (string (gethash (char u 0) *tex-superscripts*))
+                                   (concatenate 'string "^" u))
+                               out))
+               (setf i j)))
+            ((or (char= c #\{) (char= c #\}) (char= c #\&)) (incf i))   ; grouping/align -> drop
+            (t (write-char c out) (incf i))))))))
+
+(defun demath-text (s)
+  "Replace \\(...\\) and \\[...\\] LaTeX runs in S with their Unicode transliteration."
+  (if (or (search "\\(" s) (search "\\[" s))
+      (let ((out (make-string-output-stream)) (i 0))
+        (loop
+          (let* ((p1 (search "\\(" s :start2 i)) (p2 (search "\\[" s :start2 i))
+                 (p (cond ((and p1 p2) (min p1 p2)) (t (or p1 p2)))))
+            (if (null p)
+                (progn (write-string s out :start i) (return))
+                (let* ((disp (eql p p2))
+                       (close (search (if disp "\\]" "\\)") s :start2 (+ p 2))))
+                  (if (null close)
+                      (progn (write-string s out :start i) (return))
+                      (progn (write-string s out :start i :end p)
+                             (write-string (tex->unicode (subseq s (+ p 2) close)) out)
+                             (setf i (+ close 2))))))))
+        (get-output-stream-string out))
+      s))
+
+(defun demath-dom (node)
+  "Transliterate MathJax LaTeX in every text node under NODE (skips code-ish elements)."
+  (case (h:dnode-kind node)
+    (:text (let ((d (h:dnode-data node)))
+             (when (and d (or (search "\\(" d) (search "\\[" d)))
+               (setf (h:dnode-data node) (demath-text d)))))
+    (:element (unless (member (string-downcase (h:dnode-name node))
+                              '("script" "style" "pre" "code" "textarea") :test #'string=)
+                (loop for c across (h:dnode-children node) do (demath-dom c))))
+    (t (loop for c across (h:dnode-children node) do (demath-dom c)))))
+
 (defun load-page (html &key (css "") (base "") (width 1024) (viewport-height 768) url loader image-loader)
   "Parse HTML, build a fresh scripting context, run inline <script> and drain the
    initial timer/microtask queue, then render.  Returns a live PAGE.  If the scripts
    leave a degenerate render (SPA hydration cut mid-flight blanks or overlays the page),
    re-render the original markup without scripts."
-  (let* ((doc (h:parse-html html))
+  (let* ((doc (let ((d (h:parse-html html))) (demath-dom d) d))   ; MathJax LaTeX -> Unicode
          (ssr-text (dom-text-length doc))   ; content the server-rendered markup carries
          ;; prefetch external CSS/JS in parallel before the cascade needs them
          (loader (if (and loader (plusp (length base)))
@@ -84,7 +221,7 @@
     ;; that happens, discard the mutated DOM and render the original markup without
     ;; scripts.  (Height, not ink: a dark-themed page legitimately inks most pixels.)
     (when (and (> ssr-text 500) (< (r:canvas-height (page-canvas pg)) 400))
-      (let ((doc2 (h:parse-html html)))
+      (let ((doc2 (let ((d (h:parse-html html))) (demath-dom d) d)))
         (setf (page-doc pg) doc2
               (page-ctx pg) (ws:make-context doc2 :css css :width width :base base :loader loader)
               (page-js-error pg) "scripts left a degenerate render; rendered the static markup")
