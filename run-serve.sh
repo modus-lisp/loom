@@ -5,7 +5,7 @@
 cd "$(dirname "$0")" || exit 1
 PORT="${1:-9393}"
 while true; do
-  sbcl --script inspect/serve.lisp "$PORT"
+  sbcl --dynamic-space-size 4096 --script inspect/serve.lisp "$PORT"
   echo "[run-serve] serve.lisp exited ($?), restarting in 3s" >&2
   sleep 3
 done
