@@ -39,10 +39,24 @@
   "Seconds of wall-clock a page's scripts may run during load before the raster is
    taken with the DOM as it stands.")
 
+(defun dom-text-length (node)
+  "Total length of NODE's visible text (excluding <script>/<style>) — a coarse signal
+   of how much content the markup carries, used to detect when scripts blank the page."
+  (case (h:dnode-kind node)
+    (:text (length (or (h:dnode-data node) "")))
+    (:element (if (member (string-downcase (h:dnode-name node))
+                          '("script" "style" "template" "noscript") :test #'string=)
+                  0
+                  (loop for c across (h:dnode-children node) sum (dom-text-length c))))
+    (t (loop for c across (h:dnode-children node) sum (dom-text-length c)))))
+
 (defun load-page (html &key (css "") (base "") (width 1024) (viewport-height 768) url loader image-loader)
   "Parse HTML, build a fresh scripting context, run inline <script> and drain the
-   initial timer/microtask queue, then render.  Returns a live PAGE."
+   initial timer/microtask queue, then render.  Returns a live PAGE.  If the scripts
+   leave a degenerate render (SPA hydration cut mid-flight blanks or overlays the page),
+   re-render the original markup without scripts."
   (let* ((doc (h:parse-html html))
+         (ssr-text (dom-text-length doc))   ; content the server-rendered markup carries
          ;; prefetch external CSS/JS in parallel before the cascade needs them
          (loader (if (and loader (plusp (length base)))
                      (make-prefetching-loader doc base loader)
@@ -65,7 +79,17 @@
       (sb-ext:timeout () (setf (page-js-error pg) "script budget exceeded"))
       (error (e) (setf (page-js-error pg) (princ-to-string e))))
     (render-page pg)
-    (setf (page-title pg) (or (document-title doc) url "loom"))
+    ;; SPA hydration cut mid-flight by the budget can wreck the render — the content
+    ;; collapses to near-nothing while the markup plainly carried a full article.  When
+    ;; that happens, discard the mutated DOM and render the original markup without
+    ;; scripts.  (Height, not ink: a dark-themed page legitimately inks most pixels.)
+    (when (and (> ssr-text 500) (< (r:canvas-height (page-canvas pg)) 400))
+      (let ((doc2 (h:parse-html html)))
+        (setf (page-doc pg) doc2
+              (page-ctx pg) (ws:make-context doc2 :css css :width width :base base :loader loader)
+              (page-js-error pg) "scripts left a degenerate render; rendered the static markup")
+        (render-page pg)))
+    (setf (page-title pg) (or (document-title (page-doc pg)) url "loom"))
     pg))
 
 (defun url-suffix-p (suffix s)
