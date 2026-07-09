@@ -26,6 +26,7 @@
    #:run #:main #:run-shell
    ;; page model
    #:page #:page-p #:load-page #:load-url #:load-file
+   #:*progress* #:report-progress
    #:render-page #:relayout
    #:page-canvas #:page-root #:page-styles #:page-width #:page-viewport-height
    #:page-scroll-y #:page-content-height #:page-title #:page-cursor
