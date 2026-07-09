@@ -128,10 +128,21 @@ body.loading #p{display:block}
 #p::before{content:'';position:absolute;height:100%;width:40%;background:#6cf;box-shadow:0 0 8px #6cf;animation:sl 1.1s ease-in-out infinite}
 @keyframes sl{0%{left:-42%}100%{left:100%}}
 body.loading #v{opacity:.5;transition:opacity .15s}
-body.loading #s{color:#6cf}</style></head>
+body.loading #s{color:#6cf}
+#ip{display:none;padding:8px 10px;background:#1a1a1a;color:#ccc;font:11px/1.5 ui-monospace,monospace;max-height:46vh;overflow:auto}
+body.showins #ip{display:block}
+#ip h4{margin:9px 0 3px;color:#6cf;font-weight:normal;border-bottom:1px solid #333;padding-bottom:2px}
+#ip .sum{color:#9c9;margin-bottom:6px}
+#ip .row{display:flex;align-items:center;gap:6px;height:16px}
+#ip .lbl{width:160px;flex:none;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+#ip .track{flex:1;position:relative;height:9px;background:#242424;border-radius:2px}
+#ip .bar{position:absolute;height:100%;background:#6cf;border-radius:2px}
+#ip .barf{position:absolute;height:100%;background:#e66;border-radius:2px}
+#ip .ms{width:96px;flex:none;text-align:right;color:#8a8}</style></head>
 <body><div id=p></div><form id=bar novalidate><input id=u placeholder=\"https://…\" type=\"url\" inputmode=\"url\" autocapitalize=\"none\" autocorrect=\"off\" spellcheck=\"false\">
-<button type=submit>Go</button><button type=button id=flag title=\"flag this page as broken\">&#9873;</button></form><div id=s></div>
+<button type=submit>Go</button><button type=button id=flag title=\"flag this page as broken\">&#9873;</button><button type=button id=insp title=\"inspector\">&#9201;</button></form><div id=s></div>
 <img id=v>
+<div id=ip></div>
 <script>
 var v=document.getElementById('v'),u=document.getElementById('u'),s=document.getElementById('s');
 var serverUrl='~a';                 // the URL the server currently has rendered
@@ -146,7 +157,7 @@ function tick(){s.textContent=phase+'… '+((Date.now()-t0)/1000).toFixed(1)+'s'
 function startLoad(p){phase=p||'loading';document.body.classList.add('loading');t0=Date.now();tick();if(!ti)ti=setInterval(tick,200);}
 function endLoad(){document.body.classList.remove('loading');if(ti){clearInterval(ti);ti=0;}}
 function failLoad(m){endLoad();s.textContent=m;pend=null;}
-v.onload=function(){endLoad();if(pend!==null){s.textContent=pend;pend=null;}};
+v.onload=function(){endLoad();if(pend!==null){s.textContent=pend;pend=null;}refreshInspector();};
 v.onerror=function(){failLoad('could not load image');};
 function finalState(url,st){
   if(url){serverUrl=url;u.value=url;pend=st;var enc=encodeURIComponent(url);
@@ -182,6 +193,26 @@ v.onclick=function(e){
   var y=Math.round((e.clientY-r.top)*(v.naturalHeight/r.height));
   stream('/click?x='+x+'&y='+y,'opening');
 };
+// ---- inspector: performance timeline + network waterfall ----
+function esc(s){return String(s).replace(/[&<>]/g,function(c){return c=='&'?'&amp;':c=='<'?'&lt;':'&gt;';});}
+function shorten(u){var m=/^https?:\\/\\/([^\\/]*)(.*)$/.exec(u);return m?(m[1]+(m[2]||'/')):u;}
+function ibar(cls,left,w){return '<span class='+cls+' style=left:'+left.toFixed(2)+'%;width:'+Math.max(0.4,w).toFixed(2)+'%></span>';}
+function sz(b){return b>=1024?Math.round(b/1024)+'k':b+'b';}
+function renderInspector(d){
+  var done=d.phases.length?d.phases[d.phases.length-1].at:0,ne=0;
+  d.network.forEach(function(n){if(n.end>ne)ne=n.end;});
+  var total=Math.max(done,ne,1),h='';
+  h+='<div class=sum>'+(done/1000).toFixed(2)+'s · '+d.width+'×'+d.contentHeight+' · '+d.elements+' els · '+d.links+' links · '+d.images+' imgs'+(d.jsError?' · <span style=color:#e66>JS: '+esc(d.jsError)+'</span>':'')+'</div>';
+  h+='<h4>timeline</h4>';
+  for(var i=0;i<d.phases.length-1;i++){var p=d.phases[i],dur=d.phases[i+1].at-p.at;
+    h+='<div class=row><span class=lbl>'+esc(p.label)+'</span><span class=track>'+ibar('bar',100*p.at/total,100*dur/total)+'</span><span class=ms>'+dur+'ms</span></div>';}
+  h+='<h4>network ('+d.network.length+')</h4>';
+  d.network.forEach(function(n){var dur=n.end-n.start;
+    h+='<div class=row><span class=lbl>'+esc(shorten(n.url))+'</span><span class=track>'+ibar(n.ok?'bar':'barf',100*n.start/total,100*dur/total)+'</span><span class=ms>'+dur+'ms · '+sz(n.bytes)+'</span></div>';});
+  document.getElementById('ip').innerHTML=h;
+}
+function refreshInspector(){if(document.body.classList.contains('showins'))fetch('/inspect.json').then(function(r){return r.json();}).then(renderInspector).catch(function(){});}
+document.getElementById('insp').onclick=function(){if(document.body.classList.toggle('showins'))refreshInspector();};
 if(hurl())render(); else if(serverUrl){pend=s.textContent;startLoad('loading');reimg();location.hash=encodeURIComponent(serverUrl);}
 </script></body></html>"
             (%jsesc (or (and *page* (l:page-url *page*)) ""))
@@ -298,19 +329,80 @@ Returns (values out encoding-or-nil)."
           (code-char 31)
           (substitute #\Space #\Newline (or *status* ""))))
 
+(defvar *timeline* nil
+  "The last navigation's phase marks: a list of (LABEL . ELAPSED-MS).  Paired with
+   L:*NET-LOG* it drives the inspector's performance + network waterfalls.")
+
+(defun %json-str (s)
+  "S as a JSON string literal."
+  (with-output-to-string (o)
+    (write-char #\" o)
+    (loop for c across (or s "") do
+      (case c
+        (#\" (write-string "\\\"" o))
+        (#\\ (write-string "\\\\" o))
+        (#\Newline (write-string "\\n" o))
+        (#\Return (write-string "\\r" o))
+        (#\Tab (write-string "\\t" o))
+        (t (if (< (char-code c) 32) (format o "\\u~4,'0x" (char-code c)) (write-char c o)))))
+    (write-char #\" o)))
+
+(defun inspect-json ()
+  "The last navigation's timeline, network log and page metrics as JSON."
+  (let* ((pg *page*) (doc (and pg (l:page-doc pg))))
+    (multiple-value-bind (els txt) (if doc (l:dom-node-counts doc) (values 0 0))
+      (with-output-to-string (o)
+        (flet ((kv (k v) (format o "~a:~a," (%json-str k) v)))
+          (write-char #\{ o)
+          (kv "url" (%json-str (or (and pg (l:page-url pg)) "")))
+          (kv "title" (%json-str (or (and pg (l:page-title pg)) "")))
+          (kv "jsError" (if (and pg (l:page-js-error pg)) (%json-str (l:page-js-error pg)) "null"))
+          (kv "width" (if pg (l:page-width pg) 0))
+          (kv "contentHeight" (if pg (l:page-content-height pg) 0))
+          (kv "elements" els)
+          (kv "textNodes" txt)
+          (kv "images" (if doc (length (weft.css:query-select-all doc "img")) 0))
+          (kv "links" (if doc (length (weft.css:query-select-all doc "a")) 0))
+          (format o "~a:[" (%json-str "phases"))
+          (loop for (phase . ms) in *timeline* for i from 0
+                do (when (plusp i) (write-char #\, o))
+                   (format o "{~a:~a,~a:~d}"
+                           (%json-str "label") (%json-str (phase-label phase nil))
+                           (%json-str "at") ms))
+          (format o "],~a:[" (%json-str "network"))
+          (loop for (url start end bytes ok) in (reverse l:*net-log*) for i from 0
+                do (when (plusp i) (write-char #\, o))
+                   (format o "{~a:~a,~a:~d,~a:~d,~a:~d,~a:~a}"
+                           (%json-str "url") (%json-str url)
+                           (%json-str "start") start (%json-str "end") end
+                           (%json-str "bytes") (or bytes 0)
+                           (%json-str "ok") (if ok "true" "false")))
+          (format o "]}"))))))
+
 (defun run-streamed (stream thunk)
   "Stream THUNK's progress: emit each phase, force the PNG encode (so the follow-up
-   /view.png is instant), then the final state line."
+   /view.png is instant), then the final state line.  Also captures the phase
+   timeline and per-fetch network log for the inspector."
   (send-stream-headers stream "text/plain; charset=utf-8")
+  (l:net-log-reset)
   ;; The loom pipeline scopes the lower-layer hooks (fetch/TLS around the main
   ;; document fetch, render around the paint) to REPORT-PROGRESS, which forwards
   ;; here.  Binding the loom hook alone thus surfaces every phase without the many
   ;; subresource/image fetches streaming their own network detail.
-  (let ((l:*progress* (lambda (phase detail)
-                        (ignore-errors (stream-line stream (phase-label phase detail))))))
+  (let* ((marks '())
+         (emit (lambda (phase detail)
+                 ;; Timeline marks are keyed on the phase KEYWORD and collapse
+                 ;; consecutive repeats, so the many :downloading byte-counter ticks
+                 ;; become one bar; the live stream still shows every tick.
+                 (unless (and marks (eq (caar marks) phase))
+                   (push (cons phase (l:nav-elapsed-ms)) marks))
+                 (ignore-errors (stream-line stream (phase-label phase detail)))))
+         (l:*progress* emit))
     (ignore-errors (funcall thunk))
-    (funcall l:*progress* :encoding nil)
-    (ignore-errors (page-png-bytes)))
+    (funcall emit :encoding nil)
+    (ignore-errors (page-png-bytes))
+    (push (cons :done (l:nav-elapsed-ms)) marks)
+    (setf *timeline* (nreverse marks)))
   (ignore-errors (stream-line stream (state-final-line))))
 
 (defun header-value (head name)
@@ -358,6 +450,9 @@ Returns (values out encoding-or-nil)."
          (if (and url (plusp (length url)))
              (run-streamed stream (lambda () (navigate url)))
              (send stream "200 OK" "text/plain; charset=utf-8" (state-text)))))
+      ((string= path "/inspect.json")
+       ;; the last navigation's performance timeline, network log and page metrics
+       (send stream "200 OK" "application/json; charset=utf-8" (inspect-json)))
       ((string= path "/click")
        ;; a click may follow a link (page-url changes) — stream its progress like /go
        (let ((x (ignore-errors (parse-integer (or (query-param query "x") "0"))))
