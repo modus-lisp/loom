@@ -196,7 +196,8 @@ v.onclick=function(e){
 // ---- inspector: performance timeline + network waterfall ----
 function esc(s){return String(s).replace(/[&<>]/g,function(c){return c=='&'?'&amp;':c=='<'?'&lt;':'&gt;';});}
 function shorten(u){var m=/^https?:\\/\\/([^\\/]*)(.*)$/.exec(u);return m?(m[1]+(m[2]||'/')):u;}
-function ibar(cls,left,w){return '<span class='+cls+' style=left:'+left.toFixed(2)+'%;width:'+Math.max(0.4,w).toFixed(2)+'%></span>';}
+var KC={document:'#6cf',css:'#9c6',js:'#fc6',image:'#c9f',text:'#8ad',other:'#999'};
+function ibar(color,left,w){return '<span class=bar style=left:'+left.toFixed(2)+'%;width:'+Math.max(0.4,w).toFixed(2)+'%;background:'+color+'></span>';}
 function sz(b){return b>=1024?Math.round(b/1024)+'k':b+'b';}
 function renderInspector(d){
   var done=d.phases.length?d.phases[d.phases.length-1].at:0,ne=0;
@@ -205,10 +206,11 @@ function renderInspector(d){
   h+='<div class=sum>'+(done/1000).toFixed(2)+'s · '+d.width+'×'+d.contentHeight+' · '+d.elements+' els · '+d.links+' links · '+d.images+' imgs'+(d.jsError?' · <span style=color:#e66>JS: '+esc(d.jsError)+'</span>':'')+'</div>';
   h+='<h4>timeline</h4>';
   for(var i=0;i<d.phases.length-1;i++){var p=d.phases[i],dur=d.phases[i+1].at-p.at;
-    h+='<div class=row><span class=lbl>'+esc(p.label)+'</span><span class=track>'+ibar('bar',100*p.at/total,100*dur/total)+'</span><span class=ms>'+dur+'ms</span></div>';}
+    h+='<div class=row><span class=lbl>'+esc(p.label)+'</span><span class=track>'+ibar('#6cf',100*p.at/total,100*dur/total)+'</span><span class=ms>'+dur+'ms</span></div>';}
   h+='<h4>network ('+d.network.length+')</h4>';
-  d.network.forEach(function(n){var dur=n.end-n.start;
-    h+='<div class=row><span class=lbl>'+esc(shorten(n.url))+'</span><span class=track>'+ibar(n.ok?'bar':'barf',100*n.start/total,100*dur/total)+'</span><span class=ms>'+dur+'ms · '+sz(n.bytes)+'</span></div>';});
+  if(d.byKind){var parts=[];for(var k in d.byKind){var b=d.byKind[k];parts.push('<span style=color:'+(KC[k]||'#999')+'>'+k+'</span> '+b.count+'× '+sz(b.bytes)+' '+b.ms+'ms');}h+='<div class=sum>'+parts.join('   ')+'</div>';}
+  d.network.forEach(function(n){var dur=n.end-n.start,c=n.ok?(KC[n.kind]||'#6cf'):'#e66';
+    h+='<div class=row><span class=lbl>'+esc(shorten(n.url))+'</span><span class=track>'+ibar(c,100*n.start/total,100*dur/total)+'</span><span class=ms>'+dur+'ms · '+sz(n.bytes)+'</span></div>';});
   document.getElementById('ip').innerHTML=h;
 }
 function refreshInspector(){if(document.body.classList.contains('showins'))fetch('/inspect.json').then(function(r){return r.json();}).then(renderInspector).catch(function(){});}
@@ -369,15 +371,33 @@ Returns (values out encoding-or-nil)."
                    (format o "{~a:~a,~a:~d}"
                            (%json-str "label") (%json-str (phase-label phase nil))
                            (%json-str "at") ms))
-          (format o "],~a:[" (%json-str "network"))
-          (loop for (url start end bytes ok) in (reverse l:*net-log*) for i from 0
-                do (when (plusp i) (write-char #\, o))
-                   (format o "{~a:~a,~a:~d,~a:~d,~a:~d,~a:~a}"
-                           (%json-str "url") (%json-str url)
-                           (%json-str "start") start (%json-str "end") end
-                           (%json-str "bytes") (or bytes 0)
-                           (%json-str "ok") (if ok "true" "false")))
-          (format o "]}"))))))
+          (let ((net (reverse l:*net-log*)))
+            (format o "],~a:[" (%json-str "network"))
+            (loop for (url start end bytes ok kind) in net for i from 0
+                  do (when (plusp i) (write-char #\, o))
+                     (format o "{~a:~a,~a:~d,~a:~d,~a:~d,~a:~a,~a:~a}"
+                             (%json-str "url") (%json-str url)
+                             (%json-str "start") start (%json-str "end") end
+                             (%json-str "bytes") (or bytes 0)
+                             (%json-str "ok") (if ok "true" "false")
+                             (%json-str "kind") (%json-str (string-downcase (symbol-name kind)))))
+            ;; per-kind rollup: count, total bytes, summed transfer ms
+            (format o "],~a:{" (%json-str "byKind"))
+            (let ((agg '()))
+              (dolist (e net)
+                (destructuring-bind (url start end bytes ok kind) e
+                  (declare (ignore url ok))
+                  (let ((cell (assoc kind agg)))
+                    (unless cell (setf cell (list kind 0 0 0)) (push cell agg))
+                    (incf (second cell))
+                    (incf (third cell) (or bytes 0))
+                    (incf (fourth cell) (- end start)))))
+              (loop for (kind cnt kb ms) in (nreverse agg) for i from 0
+                    do (when (plusp i) (write-char #\, o))
+                       (format o "~a:{~a:~d,~a:~d,~a:~d}"
+                               (%json-str (string-downcase (symbol-name kind)))
+                               (%json-str "count") cnt (%json-str "bytes") kb (%json-str "ms") ms)))
+            (format o "}}")))))))
 
 (defun run-streamed (stream thunk)
   "Stream THUNK's progress: emit each phase, force the PNG encode (so the follow-up
