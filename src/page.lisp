@@ -65,8 +65,8 @@
 (defun nav-elapsed-ms () (rel-ms (get-internal-real-time)))
 (defun net-log-reset ()
   (sb-thread:with-mutex (*net-log-lock*) (setf *net-log* nil *net-log-t0* (get-internal-real-time))))
-(defun net-log-add (url start end bytes ok)
-  (sb-thread:with-mutex (*net-log-lock*) (push (list url start end bytes ok) *net-log*)))
+(defun net-log-add (url start end bytes ok &optional (kind :other))
+  (sb-thread:with-mutex (*net-log-lock*) (push (list url start end bytes ok kind) *net-log*)))
 
 (defun dom-node-counts (node)
   "Return (values element-count text-node-count) in NODE's subtree."
@@ -326,7 +326,8 @@
                                     (let* ((st (get-internal-real-time))
                                            (text (handler-case (fetch:fetch-text u) (error () nil))))
                                       (net-log-add u (rel-ms st) (nav-elapsed-ms)
-                                                   (and text (length text)) (and text t))
+                                                   (and text (length text)) (and text t)
+                                                   (subresource-kind u))
                                       (sb-thread:with-mutex (lock) (setf (gethash u cache) text)))
                                   (sb-thread:signal-semaphore sem)))
                               :name "prefetch"))
@@ -353,11 +354,16 @@
     (handler-case
         (let ((abs (cond ((and (>= (length url) 2) (string= (subseq url 0 2) "//"))
                           (concatenate 'string "https:" url))
-                         (t (or (resolve-url url base) url)))))
-          (let ((resp (fetch:fetch abs)))
-            (when (and resp (<= 200 (fetch:response-status resp) 299))
-              (values (fetch:response-body resp)
-                      (fetch:get-header (fetch:response-headers resp) "content-type")))))
+                         (t (or (resolve-url url base) url))))
+              (st (get-internal-real-time)))
+          (let* ((resp (fetch:fetch abs))
+                 (ok (and resp (<= 200 (fetch:response-status resp) 299)))
+                 (body (and resp (fetch:response-body resp))))
+            ;; log the image fetch so the inspector attributes "layout" time that is
+            ;; really network — <img> dimensions are fetched during layout.
+            (net-log-add abs (rel-ms st) (nav-elapsed-ms) (and body (length body)) ok :image)
+            (when ok
+              (values body (fetch:get-header (fetch:response-headers resp) "content-type")))))
       (error () (values nil nil)))))
 
 (defun load-url (url-string &key (width 1024) (viewport-height 768))
@@ -370,7 +376,7 @@
       (let ((fetch:*progress* #'report-progress) (seal:*progress* #'report-progress))
         (fetch:fetch-text url-string))
     (declare (ignore charset))
-    (net-log-add url-string (rel-ms st) (nav-elapsed-ms) (and text (length text)) (and text t))
+    (net-log-add url-string (rel-ms st) (nav-elapsed-ms) (and text (length text)) (and text t) :document)
     (let ((final (or (and resp (fetch:response-url resp)) url-string)))
       (load-page text :base final :url final
                  :width width :viewport-height viewport-height
