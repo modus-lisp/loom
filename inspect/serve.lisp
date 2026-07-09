@@ -129,8 +129,9 @@ body.loading #p{display:block}
 @keyframes sl{0%{left:-42%}100%{left:100%}}
 body.loading #v{opacity:.5;transition:opacity .15s}
 body.loading #s{color:#6cf}
-#ip{display:none;padding:8px 10px;background:#1a1a1a;color:#ccc;font:11px/1.5 ui-monospace,monospace;max-height:46vh;overflow:auto}
+#ip{display:none;position:fixed;left:0;right:0;bottom:0;z-index:30;padding:8px 10px;background:rgba(20,20,20,.96);color:#ccc;font:11px/1.5 ui-monospace,monospace;max-height:62vh;overflow:auto;border-top:1px solid #444;box-shadow:0 -3px 14px rgba(0,0,0,.6)}
 body.showins #ip{display:block}
+#ip .close{position:sticky;top:0;float:right;color:#9c9;cursor:pointer;padding:0 4px}
 #ip h4{margin:9px 0 3px;color:#6cf;font-weight:normal;border-bottom:1px solid #333;padding-bottom:2px}
 #ip .sum{color:#9c9;margin-bottom:6px}
 #ip .row{display:flex;align-items:center;gap:6px;height:16px}
@@ -202,7 +203,7 @@ function sz(b){return b>=1024?Math.round(b/1024)+'k':b+'b';}
 function renderInspector(d){
   var done=d.phases.length?d.phases[d.phases.length-1].at:0,ne=0;
   d.network.forEach(function(n){if(n.end>ne)ne=n.end;});
-  var total=Math.max(done,ne,1),h='';
+  var total=Math.max(done,ne,1),h='<span class=close>✕</span>';
   h+='<div class=sum>'+(done/1000).toFixed(2)+'s · '+d.width+'×'+d.contentHeight+' · '+d.elements+' els · '+d.links+' links · '+d.images+' imgs'+(d.jsError?' · <span style=color:#e66>JS: '+esc(d.jsError)+'</span>':'')+'</div>';
   h+='<h4>timeline</h4>';
   for(var i=0;i<d.phases.length-1;i++){var p=d.phases[i],dur=d.phases[i+1].at-p.at;
@@ -215,6 +216,7 @@ function renderInspector(d){
 }
 function refreshInspector(){if(document.body.classList.contains('showins'))fetch('/inspect.json').then(function(r){return r.json();}).then(renderInspector).catch(function(){});}
 document.getElementById('insp').onclick=function(){if(document.body.classList.toggle('showins'))refreshInspector();};
+document.getElementById('ip').onclick=function(e){if(e.target.className=='close')document.body.classList.remove('showins');};
 if(hurl())render(); else if(serverUrl){pend=s.textContent;startLoad('loading');reimg();location.hash=encodeURIComponent(serverUrl);}
 </script></body></html>"
             (%jsesc (or (and *page* (l:page-url *page*)) ""))
