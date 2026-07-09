@@ -122,32 +122,67 @@
 <style>body{margin:0;font:14px sans-serif;background:#222;color:#eee}
 #bar{position:sticky;top:0;background:#333;padding:6px;display:flex;gap:6px;z-index:9}
 #bar input{flex:1;padding:5px;font-size:16px;min-width:0}#bar button{padding:5px 12px}
-#s{padding:4px 8px;color:#9c9;font-size:12px}#v{display:block;width:100%;height:auto;background:#fff}</style></head>
-<body><form id=bar novalidate><input id=u placeholder=\"https://…\" type=\"url\" inputmode=\"url\" autocapitalize=\"none\" autocorrect=\"off\" spellcheck=\"false\">
+#s{padding:4px 8px;color:#9c9;font-size:12px}#v{display:block;width:100%;height:auto;background:#fff}
+#p{position:fixed;top:0;left:0;right:0;height:3px;overflow:hidden;z-index:20;display:none}
+body.loading #p{display:block}
+#p::before{content:'';position:absolute;height:100%;width:40%;background:#6cf;box-shadow:0 0 8px #6cf;animation:sl 1.1s ease-in-out infinite}
+@keyframes sl{0%{left:-42%}100%{left:100%}}
+body.loading #v{opacity:.5;transition:opacity .15s}
+body.loading #s{color:#6cf}</style></head>
+<body><div id=p></div><form id=bar novalidate><input id=u placeholder=\"https://…\" type=\"url\" inputmode=\"url\" autocapitalize=\"none\" autocorrect=\"off\" spellcheck=\"false\">
 <button type=submit>Go</button><button type=button id=flag title=\"flag this page as broken\">&#9873;</button></form><div id=s></div>
 <img id=v>
 <script>
 var v=document.getElementById('v'),u=document.getElementById('u'),s=document.getElementById('s');
 var serverUrl='~a';                 // the URL the server currently has rendered
 u.value=serverUrl; s.textContent='~a';
+var ti=0,t0=0,pend=null,phase='loading';   // timer handle, load start (ms), status to show once the image lands, current phase
 function hurl(){return decodeURIComponent(location.hash.slice(1));}
 function reimg(){v.src='/view.png?g='+Date.now();}
-function apply(t){var i=t.indexOf('\\n');var url=i<0?t:t.slice(0,i);serverUrl=url;if(url)u.value=url;s.textContent=i<0?'':t.slice(i+1);reimg();}
-function render(){var h=hurl();if(!h)return;u.value=h;if(h===serverUrl){reimg();return;}fetch('/go?url='+encodeURIComponent(h)).then(function(r){return r.text();}).then(apply);}
+// A navigation streams phase lines (fetching, parsing, rendering, …) then a final
+// line (SOH url US status).  Show each phase live with an elapsed counter, and hold
+// the busy state from the tap until the freshly-encoded image actually loads.
+function tick(){s.textContent=phase+'… '+((Date.now()-t0)/1000).toFixed(1)+'s';}
+function startLoad(p){phase=p||'loading';document.body.classList.add('loading');t0=Date.now();tick();if(!ti)ti=setInterval(tick,200);}
+function endLoad(){document.body.classList.remove('loading');if(ti){clearInterval(ti);ti=0;}}
+function failLoad(m){endLoad();s.textContent=m;pend=null;}
+v.onload=function(){endLoad();if(pend!==null){s.textContent=pend;pend=null;}};
+v.onerror=function(){failLoad('could not load image');};
+function finalState(url,st){
+  if(url){serverUrl=url;u.value=url;pend=st;var enc=encodeURIComponent(url);
+    if(location.hash.slice(1)!==enc){location.hash=enc;return;}}   // hash change -> render() reimgs
+  else pend=st;
+  reimg();
+}
+function onLine(ln){
+  if(!ln)return;
+  if(ln.charCodeAt(0)===1){var p=ln.slice(1).split('\\x1f');finalState(p[0]||'',p[1]||'');}
+  else{phase=ln;tick();}
+}
+function stream(endpoint,p){
+  startLoad(p);
+  fetch(endpoint).then(function(r){
+    if(!r.body||!r.body.getReader){return r.text().then(function(t){t.split('\\n').forEach(onLine);});}
+    var rd=r.body.getReader(),dec=new TextDecoder(),buf='';
+    return (function pump(){return rd.read().then(function(res){
+      if(res.value){buf+=dec.decode(res.value,{stream:true});var a=buf.split('\\n');buf=a.pop();a.forEach(onLine);}
+      if(res.done){if(buf)onLine(buf);return;}
+      return pump();
+    });})();
+  }).catch(function(){failLoad('network error');});
+}
+function render(){var h=hurl();if(!h)return;u.value=h;if(h===serverUrl){reimg();return;}stream('/go?url='+encodeURIComponent(h),'connecting');}
 window.addEventListener('hashchange',render);
 document.getElementById('bar').onsubmit=function(e){e.preventDefault();var t=u.value.trim();if(!t)return;var enc=encodeURIComponent(t);if(location.hash.slice(1)===enc)render();else location.hash=enc;};
-document.getElementById('flag').onclick=function(){fetch('/flag').then(function(r){return r.text();}).then(function(t){s.textContent=t;});};
+document.getElementById('flag').onclick=function(){fetch('/flag').then(function(r){return r.text();}).then(function(t){s.textContent=t;}).catch(function(){s.textContent='network error';});};
 v.onclick=function(e){
+  if(document.body.classList.contains('loading'))return;   // busy — ignore taps rather than queue them
   var r=v.getBoundingClientRect();
   var x=Math.round((e.clientX-r.left)*(v.naturalWidth/r.width));
   var y=Math.round((e.clientY-r.top)*(v.naturalHeight/r.height));
-  fetch('/click?x='+x+'&y='+y).then(function(r){return r.text();}).then(function(t){
-    var i=t.indexOf('\\n');var url=i<0?t:t.slice(0,i);
-    if(url&&url!==serverUrl){apply(t);var enc=encodeURIComponent(url);if(location.hash.slice(1)!==enc)location.hash=enc;}
-    else reimg();
-  });
+  stream('/click?x='+x+'&y='+y,'opening');
 };
-if(hurl())render(); else if(serverUrl){reimg();location.hash=encodeURIComponent(serverUrl);}
+if(hurl())render(); else if(serverUrl){pend=s.textContent;startLoad('loading');reimg();location.hash=encodeURIComponent(serverUrl);}
 </script></body></html>"
             (%jsesc (or (and *page* (l:page-url *page*)) ""))
             (%jsesc *status*)))
@@ -225,6 +260,50 @@ Returns (values out encoding-or-nil)."
         (write-sequence bytes stream)
         (finish-output stream)))))
 
+;;; ---- streamed progress -----------------------------------------------------
+;;; A render blocks the (single-threaded) server for seconds, so the client can't
+;;; poll for status.  Instead /go and /click stream phase lines as they work — the
+;;; response has no Content-Length, and the client reads it incrementally until the
+;;; connection closes.  The final line is SOH url US status.
+(defun send-stream-headers (stream ctype)
+  (let ((h (format nil "HTTP/1.1 200 OK~aContent-Type: ~a~aCache-Control: no-store~aX-Accel-Buffering: no~aConnection: close~a~a"
+                   +crlf+ ctype +crlf+ +crlf+ +crlf+ +crlf+ +crlf+ +crlf+)))
+    (write-sequence (sb-ext:string-to-octets h :external-format :latin-1) stream)
+    (finish-output stream)))
+
+(defun stream-line (stream text)
+  "Write one newline-terminated line and flush it to the socket immediately."
+  (write-sequence (sb-ext:string-to-octets (concatenate 'string text (string #\Newline))
+                                            :external-format :utf-8)
+                  stream)
+  (finish-output stream))
+
+(defparameter +phase-labels+
+  '((:fetching . "fetching") (:parsing . "parsing") (:loading . "loading resources")
+    (:scripting . "running scripts") (:rendering . "rendering") (:encoding . "encoding image")))
+
+(defun phase-label (phase detail)
+  (let ((base (or (cdr (assoc phase +phase-labels+)) (string-downcase (symbol-name phase)))))
+    (if (and detail (plusp (length detail))) (format nil "~a ~a" base detail) base)))
+
+(defun state-final-line ()
+  "The terminal streamed message: SOH, the page URL, US, single-line status."
+  (format nil "~c~a~c~a" (code-char 1)
+          (or (and *page* (l:page-url *page*)) "")
+          (code-char 31)
+          (substitute #\Space #\Newline (or *status* ""))))
+
+(defun run-streamed (stream thunk)
+  "Stream THUNK's progress: emit each phase, force the PNG encode (so the follow-up
+   /view.png is instant), then the final state line."
+  (send-stream-headers stream "text/plain; charset=utf-8")
+  (let ((l:*progress* (lambda (phase detail)
+                        (ignore-errors (stream-line stream (phase-label phase detail))))))
+    (ignore-errors (funcall thunk))
+    (funcall l:*progress* :encoding nil)
+    (ignore-errors (page-png-bytes)))
+  (ignore-errors (stream-line stream (state-final-line))))
+
 (defun header-value (head name)
   "Value of the NAME header (case-insensitive) in the raw request HEAD, or \"\"."
   (let* ((lower (string-downcase head))
@@ -264,17 +343,17 @@ Returns (values out encoding-or-nil)."
          (if png (send stream "200 OK" "image/png" png)
              (send stream "404 Not Found" "text/plain" "no page"))))
       ((string= path "/go")
-       ;; render URL and return the page state (current-url + status) for the client to
-       ;; reflect into the address bar / status line — the browser history is the hash.
+       ;; stream navigation progress (fetching, parsing, rendering, …) then the final
+       ;; page state; the client reflects url/status and history lives in the hash.
        (let ((url (query-param query "url")))
-         (when (and url (plusp (length url))) (navigate url)))
-       (send stream "200 OK" "text/plain; charset=utf-8" (state-text)))
+         (if (and url (plusp (length url)))
+             (run-streamed stream (lambda () (navigate url)))
+             (send stream "200 OK" "text/plain; charset=utf-8" (state-text)))))
       ((string= path "/click")
+       ;; a click may follow a link (page-url changes) — stream its progress like /go
        (let ((x (ignore-errors (parse-integer (or (query-param query "x") "0"))))
              (y (ignore-errors (parse-integer (or (query-param query "y") "0")))))
-         (when (and x y) (handle-click x y)))
-       ;; a click may follow a link (page-url changes); the client sets the hash to it
-       (send stream "200 OK" "text/plain; charset=utf-8" (state-text)))
+         (run-streamed stream (lambda () (when (and x y) (handle-click x y))))))
       ((string= path "/flag")
        ;; record the currently-shown page for later diagnosis — catches renders that are
        ;; wrong but didn't error (unstyled, missing images), which nothing else logs.

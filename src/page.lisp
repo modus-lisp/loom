@@ -39,6 +39,21 @@
   "Seconds of wall-clock a page's scripts may run during load before the raster is
    taken with the DOM as it stands.")
 
+(defvar *progress* nil
+  "When bound to a function of (PHASE &optional DETAIL), the load pipeline calls it
+   at phase boundaries — :fetching :parsing :loading :scripting :rendering — so a
+   host can surface live progress.  NIL (the default) disables reporting.")
+
+(defun report-progress (phase &optional detail)
+  "Call the progress hook if one is bound; never signals (progress is best-effort)."
+  (when *progress* (ignore-errors (funcall *progress* phase detail))))
+
+(defun url-host (u)
+  "The host portion of URL U, for progress labels (falls back to U)."
+  (let* ((p (search "://" u)) (start (if p (+ p 3) 0))
+         (end (position-if (lambda (c) (member c '(#\/ #\? #\#))) u :start start)))
+    (subseq u start (or end (length u)))))
+
 (defun dom-text-length (node)
   "Total length of NODE's visible text (excluding <script>/<style>) — a coarse signal
    of how much content the markup carries, used to detect when scripts blank the page."
@@ -192,11 +207,12 @@
    initial timer/microtask queue, then render.  Returns a live PAGE.  If the scripts
    leave a degenerate render (SPA hydration cut mid-flight blanks or overlays the page),
    re-render the original markup without scripts."
-  (let* ((doc (let ((d (h:parse-html html))) (demath-dom d) d))   ; MathJax LaTeX -> Unicode
+  (let* ((doc (progn (report-progress :parsing)
+                     (let ((d (h:parse-html html))) (demath-dom d) d)))   ; MathJax LaTeX -> Unicode
          (ssr-text (dom-text-length doc))   ; content the server-rendered markup carries
          ;; prefetch external CSS/JS in parallel before the cascade needs them
          (loader (if (and loader (plusp (length base)))
-                     (make-prefetching-loader doc base loader)
+                     (progn (report-progress :loading) (make-prefetching-loader doc base loader))
                      loader))
          (ctx (ws:make-context doc :css css :width width :base base :loader loader))
          (pg (make-page :html html :css (or css "") :base base :doc doc :ctx ctx
@@ -208,6 +224,7 @@
     ;; uncaught script error — we render the DOM as it stands rather than blank the page
     ;; (a real browser reports the error and paints anyway); the error is kept on the
     ;; page for the caller to surface/log.
+    (report-progress :scripting)
     (handler-case
         (sb-ext:with-timeout *js-budget*
           (ws:run-inline-scripts ctx)
@@ -215,6 +232,7 @@
           (ws:fire-lifecycle-events ctx)) ; DOMContentLoaded + load, so on-ready code runs
       (sb-ext:timeout () (setf (page-js-error pg) "script budget exceeded"))
       (error (e) (setf (page-js-error pg) (princ-to-string e))))
+    (report-progress :rendering)
     (render-page pg)
     ;; SPA hydration cut mid-flight by the budget can wreck the render — the content
     ;; collapses to near-nothing while the markup plainly carried a full article.  When
@@ -319,6 +337,7 @@
 
 (defun load-url (url-string &key (width 1024) (viewport-height 768))
   "Fetch and load URL-STRING as a fresh page (the network browsing entry)."
+  (report-progress :fetching (url-host url-string))
   (multiple-value-bind (text charset resp) (fetch:fetch-text url-string)
     (declare (ignore charset))
     (let ((final (or (and resp (fetch:response-url resp)) url-string)))
