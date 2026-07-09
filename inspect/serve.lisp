@@ -316,7 +316,7 @@ Returns (values out encoding-or-nil)."
     (:verifying . "verifying certificate") (:redirecting . "following redirect")
     (:downloading . "downloading") (:decoding . "decoding")
     (:fetching . "fetching") (:parsing . "parsing") (:loading . "loading resources")
-    (:scripting . "running scripts")
+    (:scripting . "running scripts") (:images . "loading images")
     (:cascade . "matching styles") (:layout . "laying out") (:painting . "painting")
     (:rendering . "rendering") (:encoding . "encoding image")))
 
