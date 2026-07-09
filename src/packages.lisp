@@ -27,7 +27,10 @@
    ;; page model
    #:page #:page-p #:load-page #:load-url #:load-file
    #:*progress* #:report-progress
+   ;; navigation instrumentation (for the inspector)
+   #:*net-log* #:net-log-reset #:nav-elapsed-ms #:dom-node-counts
    #:render-page #:relayout
+   #:page-doc
    #:page-canvas #:page-root #:page-styles #:page-width #:page-viewport-height
    #:page-scroll-y #:page-content-height #:page-title #:page-cursor
    #:page-hover-node #:page-url #:page-on-navigate #:page-js-error

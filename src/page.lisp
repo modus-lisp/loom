@@ -51,6 +51,32 @@
    this reports the loom-level phases in between (:parsing/:loading/:scripting)."
   (when *progress* (ignore-errors (funcall *progress* phase detail))))
 
+;;; ---- navigation instrumentation (for the inspector) ----------------------
+;;; Every document/subresource fetch is timed against a per-navigation clock so
+;;; the inspector can draw a network waterfall.  NET-LOG-RESET starts the clock;
+;;; the worker threads of a parallel prefetch append under a lock.
+(defvar *net-log* nil
+  "Reverse-chronological (URL START-MS END-MS BYTES OK) for the current
+   navigation's fetches.  Reset per navigation; read by the inspector endpoint.")
+(defvar *net-log-lock* (sb-thread:make-mutex))
+(defvar *net-log-t0* 0 "internal-real-time the *NET-LOG* millisecond stamps are relative to.")
+
+(defun rel-ms (abs) (round (* 1000 (/ (- abs *net-log-t0*) internal-time-units-per-second))))
+(defun nav-elapsed-ms () (rel-ms (get-internal-real-time)))
+(defun net-log-reset ()
+  (sb-thread:with-mutex (*net-log-lock*) (setf *net-log* nil *net-log-t0* (get-internal-real-time))))
+(defun net-log-add (url start end bytes ok)
+  (sb-thread:with-mutex (*net-log-lock*) (push (list url start end bytes ok) *net-log*)))
+
+(defun dom-node-counts (node)
+  "Return (values element-count text-node-count) in NODE's subtree."
+  (let ((els 0) (txt 0))
+    (labels ((walk (n)
+               (case (h:dnode-kind n) (:element (incf els)) (:text (incf txt)))
+               (loop for c across (h:dnode-children n) do (walk c))))
+      (walk node))
+    (values els txt)))
+
 (defun dom-text-length (node)
   "Total length of NODE's visible text (excluding <script>/<style>) — a coarse signal
    of how much content the markup carries, used to detect when scripts blank the page."
@@ -297,7 +323,10 @@
                               (lambda ()
                                 (sb-thread:wait-on-semaphore sem)
                                 (unwind-protect
-                                    (let ((text (handler-case (fetch:fetch-text u) (error () nil))))
+                                    (let* ((st (get-internal-real-time))
+                                           (text (handler-case (fetch:fetch-text u) (error () nil))))
+                                      (net-log-add u (rel-ms st) (nav-elapsed-ms)
+                                                   (and text (length text)) (and text t))
                                       (sb-thread:with-mutex (lock) (setf (gethash u cache) text)))
                                   (sb-thread:signal-semaphore sem)))
                               :name "prefetch"))
@@ -336,14 +365,16 @@
   ;; Scope the fine network hooks to the MAIN document fetch: the resolve/TLS/
   ;; download detail is for the page itself, not for the many subresources that
   ;; load-page fetches afterward (those are summarized by :loading / :scripting).
-  (multiple-value-bind (text charset resp)
+  (let ((st (get-internal-real-time)))
+   (multiple-value-bind (text charset resp)
       (let ((fetch:*progress* #'report-progress) (seal:*progress* #'report-progress))
         (fetch:fetch-text url-string))
     (declare (ignore charset))
+    (net-log-add url-string (rel-ms st) (nav-elapsed-ms) (and text (length text)) (and text t))
     (let ((final (or (and resp (fetch:response-url resp)) url-string)))
       (load-page text :base final :url final
                  :width width :viewport-height viewport-height
-                 :loader (make-http-loader final)))))
+                 :loader (make-http-loader final))))))
 
 (defun load-file (path &key (width 1024) (viewport-height 768))
   "Load a local HTML file as a fresh page (the default/offline browsing entry)."
