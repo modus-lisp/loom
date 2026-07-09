@@ -241,7 +241,10 @@
          (pg (make-page :html html :css (or css "") :base base :doc doc :ctx ctx
                         :width width :viewport-height viewport-height
                         :url url :loader loader
-                        :image-loader (or image-loader (make-image-loader base)))))
+                        :image-loader (or image-loader (make-image-loader base))))
+         ;; kick off <img> fetches now so they run concurrently with the scripts
+         ;; below and are warm before layout — off the critical path
+         (img-threads (start-image-prefetch doc (page-image-loader pg))))
     ;; Run the page's scripts under a wall-clock budget: a raster view doesn't need a
     ;; fully-settled JS app, and some pages spin for seconds.  On timeout — or an
     ;; uncaught script error — we render the DOM as it stands rather than blank the page
@@ -255,6 +258,10 @@
           (ws:fire-lifecycle-events ctx)) ; DOMContentLoaded + load, so on-ready code runs
       (sb-ext:timeout () (setf (page-js-error pg) "script budget exceeded"))
       (error (e) (setf (page-js-error pg) (princ-to-string e))))
+    ;; wait for the <img> prefetch started before the scripts — usually already
+    ;; done, so layout finds every bitmap in cache
+    (report-progress :images)
+    (dolist (th img-threads) (ignore-errors (sb-thread:join-thread th)))
     (render-page pg)
     ;; SPA hydration cut mid-flight by the budget can wreck the render — the content
     ;; collapses to near-nothing while the markup plainly carried a full article.  When
@@ -334,6 +341,35 @@
                            urls)))
       (dolist (th threads) (ignore-errors (sb-thread:join-thread th))))
     cache))
+
+(defparameter *image-prefetch-concurrency* 4
+  "How many <img> bitmaps to fetch at once during prefetch.  Kept low: each fetch
+   to a new host pays a CPU-bound pure-CL TLS handshake, and flooding both starves
+   the cores and defeats keep-alive connection reuse, so a wide fan-out is slower
+   than a handful of reusing workers.")
+
+(defun start-image-prefetch (doc image-loader)
+  "Spawn concurrent fetches for every network <img>, keyed exactly as layout looks
+   them up (R:IMG-SOURCE-URL — the raw src/srcset value FETCH-IMAGE caches under),
+   and return the threads.  Meant to run ALONGSIDE the script phase so the bitmaps
+   are warm by the time layout needs their dimensions, off the critical path.
+   Each worker binds *IMAGE-LOADER* itself; FETCH-IMAGE does the caching."
+  (let* ((urls (remove-duplicates
+                (loop for n in (css:query-select-all doc "img")
+                      for u = (r:img-source-url n)
+                      when (and u (not (and (>= (length u) 5) (string-equal (subseq u 0 5) "data:"))))
+                        collect u)
+                :test #'string=))
+         (sem (sb-thread:make-semaphore :count *image-prefetch-concurrency*)))
+    (mapcar (lambda (u)
+              (sb-thread:make-thread
+               (lambda ()
+                 (sb-thread:wait-on-semaphore sem)
+                 (unwind-protect
+                     (let ((r:*image-loader* image-loader)) (ignore-errors (r:fetch-image u)))
+                   (sb-thread:signal-semaphore sem)))
+               :name "img-prefetch"))
+            urls)))
 
 (defun make-prefetching-loader (doc base fallback)
   "Fetch every external stylesheet/script in DOC concurrently up front, then serve them
