@@ -45,14 +45,11 @@
    host can surface live progress.  NIL (the default) disables reporting.")
 
 (defun report-progress (phase &optional detail)
-  "Call the progress hook if one is bound; never signals (progress is best-effort)."
+  "Call the progress hook if one is bound; never signals (progress is best-effort).
+   The fetch (:resolving/:downloading), TLS (:securing) and render
+   (:cascade/:layout/:painting) sub-phases are reported by weft and seal directly;
+   this reports the loom-level phases in between (:parsing/:loading/:scripting)."
   (when *progress* (ignore-errors (funcall *progress* phase detail))))
-
-(defun url-host (u)
-  "The host portion of URL U, for progress labels (falls back to U)."
-  (let* ((p (search "://" u)) (start (if p (+ p 3) 0))
-         (end (position-if (lambda (c) (member c '(#\/ #\? #\#))) u :start start)))
-    (subseq u start (or end (length u)))))
 
 (defun dom-text-length (node)
   "Total length of NODE's visible text (excluding <script>/<style>) — a coarse signal
@@ -232,7 +229,6 @@
           (ws:fire-lifecycle-events ctx)) ; DOMContentLoaded + load, so on-ready code runs
       (sb-ext:timeout () (setf (page-js-error pg) "script budget exceeded"))
       (error (e) (setf (page-js-error pg) (princ-to-string e))))
-    (report-progress :rendering)
     (render-page pg)
     ;; SPA hydration cut mid-flight by the budget can wreck the render — the content
     ;; collapses to near-nothing while the markup plainly carried a full article.  When
@@ -337,8 +333,12 @@
 
 (defun load-url (url-string &key (width 1024) (viewport-height 768))
   "Fetch and load URL-STRING as a fresh page (the network browsing entry)."
-  (report-progress :fetching (url-host url-string))
-  (multiple-value-bind (text charset resp) (fetch:fetch-text url-string)
+  ;; Scope the fine network hooks to the MAIN document fetch: the resolve/TLS/
+  ;; download detail is for the page itself, not for the many subresources that
+  ;; load-page fetches afterward (those are summarized by :loading / :scripting).
+  (multiple-value-bind (text charset resp)
+      (let ((fetch:*progress* #'report-progress) (seal:*progress* #'report-progress))
+        (fetch:fetch-text url-string))
     (declare (ignore charset))
     (let ((final (or (and resp (fetch:response-url resp)) url-string)))
       (load-page text :base final :url final
@@ -361,7 +361,9 @@
    Refreshes the canvas, box tree, styles and content height, and re-clamps the
    scroll position."
   (multiple-value-bind (cv root styles)
-      (let ((r:*image-loader* (page-image-loader pg)))   ; network <img> over seal, cached
+      (let ((r:*image-loader* (page-image-loader pg))   ; network <img> over seal, cached
+            (r:*progress* #'report-progress)            ; :cascade / :layout / :painting
+            (fetch:*progress* nil) (seal:*progress* nil)) ; image/font fetches here aren't the document download
         (r:render-document (page-doc pg) :width (page-width pg) :css (page-css pg)))
     (setf (page-canvas pg) cv
           (page-root pg) root

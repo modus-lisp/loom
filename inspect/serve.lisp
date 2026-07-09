@@ -279,8 +279,13 @@ Returns (values out encoding-or-nil)."
   (finish-output stream))
 
 (defparameter +phase-labels+
-  '((:fetching . "fetching") (:parsing . "parsing") (:loading . "loading resources")
-    (:scripting . "running scripts") (:rendering . "rendering") (:encoding . "encoding image")))
+  '((:resolving . "resolving") (:connecting . "connecting") (:securing . "securing connection")
+    (:verifying . "verifying certificate") (:redirecting . "following redirect")
+    (:downloading . "downloading") (:decoding . "decoding")
+    (:fetching . "fetching") (:parsing . "parsing") (:loading . "loading resources")
+    (:scripting . "running scripts")
+    (:cascade . "matching styles") (:layout . "laying out") (:painting . "painting")
+    (:rendering . "rendering") (:encoding . "encoding image")))
 
 (defun phase-label (phase detail)
   (let ((base (or (cdr (assoc phase +phase-labels+)) (string-downcase (symbol-name phase)))))
@@ -297,6 +302,10 @@ Returns (values out encoding-or-nil)."
   "Stream THUNK's progress: emit each phase, force the PNG encode (so the follow-up
    /view.png is instant), then the final state line."
   (send-stream-headers stream "text/plain; charset=utf-8")
+  ;; The loom pipeline scopes the lower-layer hooks (fetch/TLS around the main
+  ;; document fetch, render around the paint) to REPORT-PROGRESS, which forwards
+  ;; here.  Binding the loom hook alone thus surfaces every phase without the many
+  ;; subresource/image fetches streaming their own network detail.
   (let ((l:*progress* (lambda (phase detail)
                         (ignore-errors (stream-line stream (phase-label phase detail))))))
     (ignore-errors (funcall thunk))
