@@ -14,7 +14,7 @@
                 real, browsable native window (SDL2 window + input -> weft render
                 + DOM events).  FFI lives here only; the engine stays pure CL."
   :version "0.0.1" :author "ynniv" :license "MIT"
-  :depends-on ("weft/render" "weft/script" "weft/fetch" "cffi")
+  :depends-on ("weft/render" "weft/script" "weft/fetch" "seal" "cffi")
   :serial t
   :components ((:module "src" :serial t
                 :components ((:file "packages")
