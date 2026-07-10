@@ -23,6 +23,7 @@
   (url nil)                             ; this page's own URL (for link resolution)
   (loader nil)
   (image-loader nil)                    ; (url) -> (values bytes mime) for network <img>
+  (font-loader nil)                     ; (url) -> bytes for an @font-face src (web fonts)
   (js-error nil)                        ; message of a script error that didn't stop the render
   (on-navigate nil))                    ; (page absolute-url) -> t : the shell follows a link
 
@@ -241,7 +242,8 @@
          (pg (make-page :html html :css (or css "") :base base :doc doc :ctx ctx
                         :width width :viewport-height viewport-height
                         :url url :loader loader
-                        :image-loader (or image-loader (make-image-loader base))))
+                        :image-loader (or image-loader (make-image-loader base))
+                        :font-loader (make-font-loader base)))
          ;; kick off <img> fetches now so they run concurrently with the scripts
          ;; below and are warm before layout — off the critical path
          (img-threads (start-image-prefetch doc (page-image-loader pg))))
@@ -402,6 +404,42 @@
               (values body (fetch:get-header (fetch:response-headers resp) "content-type")))))
       (error () (values nil nil)))))
 
+(defun make-font-loader (base)
+  "An (url) -> bytes fetcher for @font-face `src` web fonts over seal, resolving
+   relative and protocol-relative URLs against BASE.  NIL on any failure (the
+   render then keeps the bundled fallback face)."
+  (lambda (url)
+    (handler-case
+        (let ((abs (cond ((and (>= (length url) 2) (string= (subseq url 0 2) "//"))
+                          (concatenate 'string "https:" url))
+                         (t (or (resolve-url url base) url))))
+              (st (get-internal-real-time)))
+          (let* ((resp (fetch:fetch abs))
+                 (ok (and resp (<= 200 (fetch:response-status resp) 299)))
+                 (raw (and resp (fetch:response-body resp)))
+                 ;; font CDNs (gstatic) may gzip the response even for binary fonts;
+                 ;; unlike HTML the font path gets the raw body, so decode the
+                 ;; transport Content-Encoding here (gzip magic 1F 8B / deflate).
+                 (enc (and resp (fetch:get-header (fetch:response-headers resp) "content-encoding")))
+                 (body (font-decode-body raw enc)))
+            (net-log-add abs (rel-ms st) (nav-elapsed-ms) (and body (length body)) ok :font)
+            (and ok body)))
+      (error () nil))))
+
+(defun font-decode-body (bytes enc)
+  "Decode a font response BYTES per its Content-Encoding ENC (or a sniffed gzip
+magic), returning the raw font file.  Passes through when not compressed."
+  (when bytes
+    (let ((e (and enc (string-downcase (string-trim '(#\Space) enc)))))
+      (cond
+        ((or (equal e "gzip") (equal e "x-gzip")
+             (and (>= (length bytes) 2) (= (aref bytes 0) #x1F) (= (aref bytes 1) #x8B)))
+         (or (ignore-errors (deflate:gzip-decompress bytes)) bytes))
+        ((equal e "deflate")
+         (or (ignore-errors (deflate:zlib-decompress bytes))
+             (ignore-errors (deflate:inflate bytes)) bytes))
+        (t bytes)))))
+
 (defun load-url (url-string &key (width 1024) (viewport-height 768))
   "Fetch and load URL-STRING as a fresh page (the network browsing entry)."
   ;; Scope the fine network hooks to the MAIN document fetch: the resolve/TLS/
@@ -435,6 +473,7 @@
    scroll position."
   (multiple-value-bind (cv root styles)
       (let ((r:*image-loader* (page-image-loader pg))   ; network <img> over seal, cached
+            (r:*font-loader* (page-font-loader pg))     ; @font-face web fonts over seal
             (r:*progress* #'report-progress)            ; :cascade / :layout / :painting
             (fetch:*progress* nil) (seal:*progress* nil)) ; image/font fetches here aren't the document download
         (r:render-document (page-doc pg) :width (page-width pg) :css (page-css pg)))
