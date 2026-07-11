@@ -264,6 +264,9 @@
     ;; done, so layout finds every bitmap in cache
     (report-progress :images)
     (dolist (th img-threads) (ignore-errors (sb-thread:join-thread th)))
+    ;; replay a JS Web Font Loader (WebFontConfig) the headless run can't finish,
+    ;; so a page's own web fonts (and the .wf-active rules that gate them) apply
+    (ignore-errors (apply-web-font-loader pg))
     (render-page pg)
     ;; SPA hydration cut mid-flight by the budget can wreck the render — the content
     ;; collapses to near-nothing while the markup plainly carried a full article.  When
@@ -439,6 +442,56 @@ magic), returning the raw font file.  Passes through when not compressed."
          (or (ignore-errors (deflate:zlib-decompress bytes))
              (ignore-errors (deflate:inflate bytes)) bytes))
         (t bytes)))))
+
+(defun %wfl-slug (family)
+  "Web Font Loader class slug for a Google-font spec: the family name up to the
+first `:`, lowercased with spaces removed.  \"Fondamento:r:latin\" -> \"fondamento\"."
+  (let* ((name (subseq family 0 (or (position #\: family) (length family)))))
+    (remove #\Space (string-downcase (string-trim '(#\Space) name)))))
+
+(defun %set-class (node value)
+  "Set NODE's class attribute to VALUE (mutating its attr alist)."
+  (let ((cell (assoc "class" (h:dnode-attrs node) :test #'string-equal)))
+    (if cell (setf (cdr cell) value)
+        (setf (h:dnode-attrs node) (cons (cons "class" value) (h:dnode-attrs node))))))
+
+(defun apply-web-font-loader (pg)
+  "Replay the Web Font Loader (WebFontConfig) a headless render can't finish: fetch
+the declared font CSS, register the @font-face faces, and flip the <html> class from
+`wf-loading` to `wf-active` (plus the per-family `wf-<slug>-n4-active`) so the theme's
+`.wf-active …{font-family:…}` rules apply.  A no-op when the page declares no config.
+Returns T when a config was found and applied."
+  (let ((ctx (page-ctx pg)))
+    (multiple-value-bind (api fams) (ws:web-font-config ctx)
+      (when (and api fams)
+        (report-progress :fonts)
+        (let ((css (with-output-to-string (o)
+                     (dolist (fam fams)
+                       (let* ((u (format nil "~a?family=~a" api (substitute #\+ #\Space fam)))
+                              (txt (ignore-errors (nth-value 0 (fetch:fetch-text u)))))
+                         (when txt (write-string txt o) (terpri o)))))))
+          ;; register the web fonts named by the fetched @font-face CSS
+          (let ((r:*font-loader* (page-font-loader pg)))
+            (ignore-errors (r:load-font-faces (css:parse-stylesheet css))))
+          ;; activate the theme's web-font rules on <html>
+          (let ((html (css:query-select (page-doc pg) "html")))
+            (when html
+              (let ((classes (remove-if (lambda (c) (member c '("wf-loading" "wf-inactive") :test #'string=))
+                                        (loom-split-ws (or (cdr (assoc "class" (h:dnode-attrs html) :test #'string-equal)) "")))))
+                (pushnew "wf-active" classes :test #'string=)
+                (dolist (f fams) (pushnew (format nil "wf-~a-n4-active" (%wfl-slug f)) classes :test #'string=))
+                (%set-class html (format nil "~{~a~^ ~}" (nreverse classes))))))
+          t)))))
+
+(defun loom-split-ws (s)
+  "Split S on ASCII whitespace into non-empty tokens."
+  (let ((out '()) (start nil) (n (length s)))
+    (dotimes (i n)
+      (if (member (char s i) '(#\Space #\Tab #\Newline #\Return))
+          (when start (push (subseq s start i) out) (setf start nil))
+          (unless start (setf start i))))
+    (when start (push (subseq s start n) out))
+    (nreverse out)))
 
 (defun load-url (url-string &key (width 1024) (viewport-height 768))
   "Fetch and load URL-STRING as a fresh page (the network browsing entry)."
