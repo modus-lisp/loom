@@ -7,4 +7,4 @@
 export PATH="/usr/local/bin:/usr/bin:/bin:$PATH"
 cd /home/claude/loom || exit 1
 echo "===== hn-audit $(date -u +%FT%TZ) ====="
-exec python3 inspect/hn-audit.py
+exec sbcl --dynamic-space-size 4096 --script inspect/hn-audit.lisp
