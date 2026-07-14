@@ -37,7 +37,7 @@
     (and el (let ((tx (dom:text-content el)))
               (and (plusp (length (string-trim '(#\Space #\Tab #\Newline #\Return) tx))) tx)))))
 
-(defparameter *js-budget* 2.0
+(defparameter *js-budget* 6.0
   "Seconds of wall-clock a page's scripts may run during load before the raster is
    taken with the DOM as it stands.")
 
@@ -258,7 +258,12 @@
         (sb-ext:with-timeout *js-budget*
           (ws:run-inline-scripts ctx)
           (ws:pump-timers ctx 0)          ; settle 0-delay tasks/microtasks; future timers wait
-          (ws:fire-lifecycle-events ctx)) ; DOMContentLoaded + load, so on-ready code runs
+          (ws:fire-lifecycle-events ctx)  ; DOMContentLoaded + load, so on-ready code runs
+          ;; then drain the macrotask queue (advancing the virtual clock) so a load
+          ;; handler that chains work through setTimeout — a test runner like Acid3,
+          ;; SPA bootstrapping — actually runs, not just its first tick.  The wall-clock
+          ;; budget above still bounds a self-rescheduling animation/poll loop.
+          (ws:run-event-loop ctx :max-tasks 2000000))
       (sb-ext:timeout () (setf (page-js-error pg) "script budget exceeded"))
       (error (e) (setf (page-js-error pg) (princ-to-string e))))
     ;; wait for the <img> prefetch started before the scripts — usually already
