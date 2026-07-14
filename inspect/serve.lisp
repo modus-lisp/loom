@@ -71,11 +71,15 @@
   (navigate target))
 
 (defun navigate (url)
-  (handler-case
+  ;; Render at the client's own width; height comes from content flow (reader view).
+  ;; The only exception is a page that clips at the root (a viewport-model page like
+  ;; Acid2): it gets a fixed viewport whose height is a 4:3 slice of that width.
+  (let ((vph (max 480 (round (* *render-width* 3/4)))))
+   (handler-case
       (let ((pg (if (or (search "://" url) (eql 0 (search "http" url)))
-                    (l:load-url url :width *render-width* :viewport-height 100000)
+                    (l:load-url url :width *render-width* :viewport-height vph)
                     (l:load-url (concatenate 'string "https://" url)
-                                :width *render-width* :viewport-height 100000))))
+                                :width *render-width* :viewport-height vph))))
         (setf (l:page-on-navigate pg) (lambda (p tgt) (declare (ignore p)) (follow tgt)))
         ;; the page rendered, but record a non-fatal script error for observability
         (when (l:page-js-error pg) (log-error "script" url (l:page-js-error pg)))
@@ -84,7 +88,7 @@
         (incf *gen*))
     (error (e)
       (log-error "navigate" url e)
-      (setf *status* (format nil "couldn't load ~a  (~a)" url e)))))
+      (setf *status* (format nil "couldn't load ~a  (~a)" url e))))))
 
 (defvar *png-cache* nil)
 (defvar *png-cache-gen* -1)
