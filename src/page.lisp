@@ -21,6 +21,7 @@
   (cursor "default")
   (title "loom")
   (url nil)                             ; this page's own URL (for link resolution)
+  (fragment nil)                        ; the URL #fragment id, if any — scroll target for a viewport-model page
   (loader nil)
   (image-loader nil)                    ; (url) -> (values bytes mime) for network <img>
   (font-loader nil)                     ; (url) -> bytes for an @font-face src (web fonts)
@@ -226,7 +227,7 @@
                 (loop for c across (h:dnode-children node) do (demath-dom c))))
     (t (loop for c across (h:dnode-children node) do (demath-dom c)))))
 
-(defun load-page (html &key (css "") (base "") (width 1024) (viewport-height 768) url loader image-loader)
+(defun load-page (html &key (css "") (base "") (width 1024) (viewport-height 768) url fragment loader image-loader)
   "Parse HTML, build a fresh scripting context, run inline <script> and drain the
    initial timer/microtask queue, then render.  Returns a live PAGE.  If the scripts
    leave a degenerate render (SPA hydration cut mid-flight blanks or overlays the page),
@@ -241,7 +242,7 @@
          (ctx (ws:make-context doc :css css :width width :base base :loader loader))
          (pg (make-page :html html :css (or css "") :base base :doc doc :ctx ctx
                         :width width :viewport-height viewport-height
-                        :url url :loader loader
+                        :url url :fragment fragment :loader loader
                         :image-loader (or image-loader (make-image-loader base))
                         :font-loader (make-font-loader base)))
          ;; kick off <img> fetches now so they run concurrently with the scripts
@@ -504,8 +505,12 @@ Returns T when a config was found and applied."
         (fetch:fetch-text url-string))
     (declare (ignore charset))
     (net-log-add url-string (rel-ms st) (nav-elapsed-ms) (and text (length text)) (and text t) :document)
-    (let ((final (or (and resp (fetch:response-url resp)) url-string)))
-      (load-page text :base final :url final
+    (let* ((final (or (and resp (fetch:response-url resp)) url-string))
+           ;; the #fragment is client-side (never sent) — carry it as the scroll
+           ;; target so a viewport-model page (e.g. Acid2's test.html#top) composes.
+           (hash (position #\# url-string))
+           (frag (and hash (< (1+ hash) (length url-string)) (subseq url-string (1+ hash)))))
+      (load-page text :base final :url final :fragment frag
                  :width width :viewport-height viewport-height
                  :loader (make-http-loader final))))))
 
@@ -529,7 +534,12 @@ Returns T when a config was found and applied."
             (r:*font-loader* (page-font-loader pg))     ; @font-face web fonts over seal
             (r:*progress* #'report-progress)            ; :cascade / :layout / :painting
             (fetch:*progress* nil) (seal:*progress* nil)) ; image/font fetches here aren't the document download
-        (r:render-document (page-doc pg) :width (page-width pg) :css (page-css pg)))
+        ;; VIEWPORT-HEIGHT/SCROLL-TO only take effect when the page clips at the root
+        ;; (a viewport-model page like Acid2); a normal page ignores them and its
+        ;; canvas still grows to content height (reader view).
+        (r:render-document (page-doc pg) :width (page-width pg) :css (page-css pg)
+                           :viewport-height (page-viewport-height pg)
+                           :scroll-to (page-fragment pg)))
     (setf (page-canvas pg) cv
           (page-root pg) root
           (page-styles pg) styles
