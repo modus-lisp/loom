@@ -25,6 +25,17 @@
   "Layout width pages are rendered at — driven by the client's viewport width (a `vw`
    cookie) so mobile gets a readable device-width render instead of a shrunk 1024px page.")
 
+;;; The server is threaded (one thread per connection) so a slow render doesn't
+;;; freeze the whole service — read requests (/view.png, /, status) are answered
+;;; while a navigation renders.  These locks serialize the mutating work:
+;;;  *RENDER-LOCK*  one render (navigate/click/relayout) at a time; readers skip it,
+;;;                 so they see the CURRENT page until the new one atomically swaps in.
+;;;  *PNG-LOCK*     guards the per-*GEN* PNG encode cache.
+;;;  *ERRLOG-LOCK*  the sqlite handle is not reentrant.
+(defvar *render-lock* (sb-thread:make-mutex :name "render"))
+(defvar *png-lock* (sb-thread:make-mutex :name "png-cache"))
+(defvar *errlog-lock* (sb-thread:make-mutex :name "errlog"))
+
 ;;; ---- error log (system libsqlite3 over sb-alien; no schema of our own) -----
 (ignore-errors (sb-alien:load-shared-object "libsqlite3.so.0"))
 (sb-alien:define-alien-routine ("sqlite3_open" %sqlite-open) sb-alien:int
@@ -37,7 +48,9 @@
 (defvar *errdb* nil "libsqlite3 handle (a SAP), or NIL if logging is unavailable.")
 (defun %nsap () (sb-sys:int-sap 0))
 (defun errlog-exec (sql)
-  (when *errdb* (ignore-errors (%sqlite-exec *errdb* sql (%nsap) (%nsap) (%nsap)))))
+  (when *errdb*
+    (sb-thread:with-mutex (*errlog-lock*)
+      (ignore-errors (%sqlite-exec *errdb* sql (%nsap) (%nsap) (%nsap))))))
 
 (defun errlog-open (path)
   "Open (creating) the sqlite error log at PATH and ensure the table exists."
@@ -95,12 +108,16 @@
 (defun page-png-bytes ()
   "Encode the current page canvas to a compressed PNG in memory, cached per *GEN* — the
    DEFLATE encode costs seconds on a tall page, so encode once per navigation, not per
-   /view.png request.  No temp file, so a full disk can't break rendering."
-  (when *page*
-    (unless (and *png-cache* (= *png-cache-gen* *gen*))
-      (setf *png-cache* (coerce (r:canvas->png (l:page-canvas *page*)) '(simple-array (unsigned-byte 8) (*)))
-            *png-cache-gen* *gen*))
-    *png-cache*))
+   /view.png request.  No temp file, so a full disk can't break rendering.  Thread-safe:
+   a /view.png reader encodes the CURRENT page (snapshotted) while another thread renders
+   the next one; the cache update is serialized on *PNG-LOCK*."
+  (let ((pg *page*) (gen *gen*))          ; snapshot so a concurrent swap can't tear the encode
+    (when pg
+      (sb-thread:with-mutex (*png-lock*)
+        (unless (and *png-cache* (= *png-cache-gen* gen))
+          (setf *png-cache* (coerce (r:canvas->png (l:page-canvas pg)) '(simple-array (unsigned-byte 8) (*)))
+                *png-cache-gen* gen))
+        *png-cache*))))
 
 (defun state-text ()
   "The client-facing page state: current URL on the first line, status on the second."
@@ -451,8 +468,10 @@ Returns (values out encoding-or-nil)."
          (vw (and p (ignore-errors (parse-integer cookie :start (+ p 3) :junk-allowed t))))
          (desired (if (and vw (<= 280 vw 2400)) vw 1024)))
     (when (/= desired *render-width*)
-      (setf *render-width* desired)
-      (when *page* (ignore-errors (l:relayout *page* *render-width*) (incf *gen*))))))
+      (sb-thread:with-mutex (*render-lock*)     ; mutates *PAGE*: serialize with renders
+        (when (/= desired *render-width*)       ; re-check under the lock
+          (setf *render-width* desired)
+          (when *page* (ignore-errors (l:relayout *page* *render-width*) (incf *gen*))))))))
 
 (defun handle (stream)
   (let* ((head (read-head stream))
@@ -474,7 +493,8 @@ Returns (values out encoding-or-nil)."
        ;; page state; the client reflects url/status and history lives in the hash.
        (let ((url (query-param query "url")))
          (if (and url (plusp (length url)))
-             (run-streamed stream (lambda () (navigate url)))
+             (sb-thread:with-mutex (*render-lock*)   ; one render at a time
+               (run-streamed stream (lambda () (navigate url))))
              (send stream "200 OK" "text/plain; charset=utf-8" (state-text)))))
       ((string= path "/inspect.json")
        ;; the last navigation's performance timeline, network log and page metrics
@@ -483,7 +503,8 @@ Returns (values out encoding-or-nil)."
        ;; a click may follow a link (page-url changes) — stream its progress like /go
        (let ((x (ignore-errors (parse-integer (or (query-param query "x") "0"))))
              (y (ignore-errors (parse-integer (or (query-param query "y") "0")))))
-         (run-streamed stream (lambda () (when (and x y) (handle-click x y))))))
+         (sb-thread:with-mutex (*render-lock*)       ; one render at a time
+           (run-streamed stream (lambda () (when (and x y) (handle-click x y)))))))
       ((string= path "/flag")
        ;; record the currently-shown page for later diagnosis — catches renders that are
        ;; wrong but didn't error (unstyled, missing images), which nothing else logs.
@@ -511,17 +532,23 @@ Returns (values out encoding-or-nil)."
     (unwind-protect
         (loop
           ;; Nothing a single connection does (reset, malformed request, a render
-          ;; that throws) may take the server down — wrap the whole accept/serve/close.
+          ;; that throws) may take the server down — wrap the whole accept.
           (handler-case
               (let ((c (sock:socket-accept s)))
-                (unwind-protect
-                    (let ((stream (sock:socket-make-stream c :element-type '(unsigned-byte 8)
-                                                             :input t :output t)))
-                      (handler-case (handle stream)
-                        (serious-condition (e) (format t "~&[req] ~a~%" e) (log-error "request" nil e)))
-                      (ignore-errors (finish-output stream))
-                      (ignore-errors (close stream)))
-                  (ignore-errors (sock:socket-close c))))
+                ;; Serve each connection on its own thread: a multi-second render
+                ;; holds only *RENDER-LOCK*, so concurrent /view.png, / and status
+                ;; requests are answered against the current page meanwhile.
+                (sb-thread:make-thread
+                 (lambda ()
+                   (unwind-protect
+                       (let ((stream (sock:socket-make-stream c :element-type '(unsigned-byte 8)
+                                                                :input t :output t)))
+                         (handler-case (handle stream)
+                           (serious-condition (e) (format t "~&[req] ~a~%" e) (log-error "request" nil e)))
+                         (ignore-errors (finish-output stream))
+                         (ignore-errors (close stream)))
+                     (ignore-errors (sock:socket-close c))))
+                 :name "req"))
             (serious-condition (e) (format t "~&[accept] ~a~%" e) (log-error "accept" nil e))))
       (ignore-errors (sock:socket-close s)))))
 
