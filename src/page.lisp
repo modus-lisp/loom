@@ -286,6 +286,9 @@
     ;; replay a JS Web Font Loader (WebFontConfig) the headless run can't finish,
     ;; so a page's own web fonts (and the .wf-active rules that gate them) apply
     (ignore-errors (apply-web-font-loader pg))
+    ;; release modal traps (scroll-lock) so a reader view shows content, not a
+    ;; cropped single screen — after scripts, so it overrides what they set.
+    (when *de-modal* (ignore-errors (de-modal (page-doc pg))))
     (render-page pg)
     ;; SPA hydration cut mid-flight by the budget can wreck the render — the content
     ;; collapses to near-nothing while the markup plainly carried a full article.  When
@@ -498,6 +501,31 @@ first `:`, lowercased with spaces removed.  \"Fondamento:r:latin\" -> \"fondamen
   (let ((cell (assoc "class" (h:dnode-attrs node) :test #'string-equal)))
     (if cell (setf (cdr cell) value)
         (setf (h:dnode-attrs node) (cons (cons "class" value) (h:dnode-attrs node))))))
+
+(defparameter *de-modal* t
+  "When true, LOAD-PAGE runs the DE-MODAL stage before rendering: it neutralizes
+   page-level modal traps that would otherwise crop a raster view to a single,
+   mostly-empty screen.  webloom leaves this on (it renders whole pages for a
+   reader, not an interactive session that could dismiss a dialog); a spec-faithful
+   embedder can bind it NIL.")
+
+(defun %append-inline-style (node decl)
+  "Append the CSS declaration text DECL to NODE's inline `style` attribute."
+  (let ((cell (assoc "style" (h:dnode-attrs node) :test #'string-equal)))
+    (if cell
+        (setf (cdr cell) (format nil "~a;~a" (cdr cell) decl))
+        (setf (h:dnode-attrs node) (cons (cons "style" decl) (h:dnode-attrs node))))))
+
+(defun de-modal (doc)
+  "Release page-level modal traps in DOC so a raster view shows the content, not a
+   cropped screen of placeholders.  Currently: forces overflow:visible on <html>
+   and <body> (inline !important wins the cascade), undoing the scroll-lock a modal
+   or consent dialog sets — which weft's viewport model would otherwise read as a
+   fixed, single-screen page (nytimes.com's mobile layout does exactly this).  A
+   natural place to also hide full-viewport overlays/scrims later."
+  (dolist (sel '("html" "body"))
+    (let ((el (css:query-select doc sel)))
+      (when el (%append-inline-style el "overflow:visible !important")))))
 
 (defun apply-web-font-loader (pg)
   "Replay the Web Font Loader (WebFontConfig) a headless render can't finish: fetch
