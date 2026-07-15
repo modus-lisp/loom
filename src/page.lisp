@@ -246,8 +246,13 @@
                         :image-loader (or image-loader (make-image-loader base))
                         :font-loader (make-font-loader base)))
          ;; kick off <img> fetches now so they run concurrently with the scripts
-         ;; below and are warm before layout — off the critical path
-         (img-threads (start-image-prefetch doc (page-image-loader pg))))
+         ;; below and are warm before layout — off the critical path.  The whole
+         ;; render (prefetch workers AND the main-thread layout) shares one image
+         ;; deadline, so slow/hung image URLs can't stall the paint past the budget.
+         (img-deadline (+ (get-internal-real-time)
+                          (round (* *image-prefetch-budget* internal-time-units-per-second))))
+         (r:*image-fetch-deadline* img-deadline)
+         (img-threads (start-image-prefetch doc (page-image-loader pg) img-deadline)))
     ;; Run the page's scripts under a wall-clock budget: a raster view doesn't need a
     ;; fully-settled JS app, and some pages spin for seconds.  On timeout — or an
     ;; uncaught script error — we render the DOM as it stands rather than blank the page
@@ -255,7 +260,10 @@
     ;; page for the caller to surface/log.
     (report-progress :scripting)
     (handler-case
-        (sb-ext:with-timeout *js-budget*
+        ;; bind the image loader for the script phase too, so an <img> whose src a
+        ;; script sets can fetch and fire its load event (onload-driven lazy images).
+        (let ((r:*image-loader* (page-image-loader pg)))
+         (sb-ext:with-timeout *js-budget*
           (ws:run-inline-scripts ctx)
           (ws:pump-timers ctx 0)          ; settle 0-delay tasks/microtasks; future timers wait
           (ws:fire-lifecycle-events ctx)  ; DOMContentLoaded + load, so on-ready code runs
@@ -263,13 +271,14 @@
           ;; handler that chains work through setTimeout — a test runner like Acid3,
           ;; SPA bootstrapping — actually runs, not just its first tick.  The wall-clock
           ;; budget above still bounds a self-rescheduling animation/poll loop.
-          (ws:run-event-loop ctx :max-tasks 2000000))
+          (ws:run-event-loop ctx :max-tasks 2000000)))
       (sb-ext:timeout () (setf (page-js-error pg) "script budget exceeded"))
       (error (e) (setf (page-js-error pg) (princ-to-string e))))
     ;; wait for the <img> prefetch started before the scripts — usually already
-    ;; done, so layout finds every bitmap in cache
+    ;; done, so layout finds every bitmap in cache — but only up to the prefetch
+    ;; budget, so a page whose slowest images hang to the read-timeout still paints.
     (report-progress :images)
-    (dolist (th img-threads) (ignore-errors (sb-thread:join-thread th)))
+    (join-threads-until img-threads img-deadline)
     ;; replay a JS Web Font Loader (WebFontConfig) the headless run can't finish,
     ;; so a page's own web fonts (and the .wf-active rules that gate them) apply
     (ignore-errors (apply-web-font-loader pg))
@@ -359,12 +368,31 @@
    the cores and defeats keep-alive connection reuse, so a wide fan-out is slower
    than a handful of reusing workers.")
 
-(defun start-image-prefetch (doc image-loader)
+(defparameter *image-prefetch-budget* 12.0
+  "Seconds (from prefetch start) the render will wait for <img> bitmaps before
+   painting anyway.  A page with many images — some slow ad/CDN URLs that hang to
+   the fetch read-timeout — must not block the whole render on the slowest ones
+   (nytimes.com stalled ~85s this way).  Images that miss the budget keep fetching
+   and simply aren't in this render.")
+
+(defun join-threads-until (threads deadline)
+  "Join THREADS, but stop blocking once the internal-real-time DEADLINE passes:
+   already-finished workers are collected, still-running ones are left to finish
+   on their own so one slow fetch can't hold the render hostage."
+  (dolist (th threads)
+    (let ((remaining (/ (- deadline (get-internal-real-time))
+                        internal-time-units-per-second 1.0)))
+      (if (> remaining 0.02)
+          (ignore-errors (sb-thread:join-thread th :timeout remaining :default nil))
+          (return)))))            ; budget spent: leave the rest running
+
+(defun start-image-prefetch (doc image-loader deadline)
   "Spawn concurrent fetches for every network <img>, keyed exactly as layout looks
    them up (R:IMG-SOURCE-URL — the raw src/srcset value FETCH-IMAGE caches under),
    and return the threads.  Meant to run ALONGSIDE the script phase so the bitmaps
    are warm by the time layout needs their dimensions, off the critical path.
-   Each worker binds *IMAGE-LOADER* itself; FETCH-IMAGE does the caching."
+   Each worker binds *IMAGE-LOADER* and the fetch DEADLINE itself (dynamic bindings
+   don't cross threads); FETCH-IMAGE does the caching and honours the deadline."
   (let* ((urls (remove-duplicates
                 (loop for n in (css:query-select-all doc "img")
                       for u = (r:img-source-url n)
@@ -377,7 +405,8 @@
                (lambda ()
                  (sb-thread:wait-on-semaphore sem)
                  (unwind-protect
-                     (let ((r:*image-loader* image-loader)) (ignore-errors (r:fetch-image u)))
+                     (let ((r:*image-loader* image-loader) (r:*image-fetch-deadline* deadline))
+                       (ignore-errors (r:fetch-image u)))
                    (sb-thread:signal-semaphore sem)))
                :name "img-prefetch"))
             urls)))
