@@ -197,6 +197,10 @@ body.loading #s{color:#6cf}
 #st .srow{padding:2px 0;overflow-wrap:anywhere}#st .k{color:#e88}#st .dim{color:#888}#st .det{color:#aaa;padding-left:10px}
 body.statusview #bar,body.statusview #v,body.statusview #s{display:none}
 body.statusview #st{display:block}
+body.sidebar{padding-right:340px}
+body.sidebar #st{display:block;position:fixed;top:0;right:0;bottom:0;width:340px;box-sizing:border-box;overflow:auto;background:#242424;border-left:1px solid #444;z-index:15}
+#st .dock{cursor:pointer;color:#6cf;display:inline-block;padding:3px 9px;background:#2a2a2a;border-radius:5px;margin-bottom:8px}#st .dock:hover{background:#333}
+#tabs .status.docked{opacity:.6}
 #ip{display:none;position:fixed;left:0;right:0;bottom:0;z-index:30;padding:8px 10px;background:rgba(20,20,20,.96);color:#ccc;font:11px/1.5 ui-monospace,monospace;max-height:62vh;overflow:auto;border-top:1px solid #444;box-shadow:0 -3px 14px rgba(0,0,0,.6)}
 body.showins #ip{display:block}
 #ip .close{position:sticky;top:0;float:right;color:#9c9;cursor:pointer;padding:0 4px}
@@ -226,10 +230,23 @@ if(!tabs.length){tabs=[{id:newId(),url:'',title:''}];active=tabs[0].id;}
 if(active!=='status'&&!tabs.some(function(t){return t.id===active;}))active=tabs[0].id;
 function save(){try{sessionStorage.setItem('loomtabs',JSON.stringify(tabs));sessionStorage.setItem('loomactive',active);}catch(e){}}
 function tabById(id){for(var i=0;i<tabs.length;i++)if(tabs[i].id===id)return tabs[i];return null;}
+// On a desktop-width window the status tab can dock as a right sidebar so the page
+// stays visible; on narrow screens it is always a full tab.  Preference persists.
+var sidebar=localStorage.getItem('loomsidebar')==='1';
+function isDesk(){return window.innerWidth>=900;}
+function sideOn(){return sidebar&&isDesk();}
+function firstBrowseId(){if(!tabs.length){tabs=[{id:newId(),url:'',title:''}];}return tabs[0].id;}
+function applyLayout(){document.body.classList.toggle('sidebar',sideOn());}
+function toggleSidebar(){
+  sidebar=!sidebar;try{localStorage.setItem('loomsidebar',sidebar?'1':'0');}catch(e){}
+  if(sideOn()){if(active==='status')active=firstBrowseId();}else{active='status';}
+  applyLayout();save();renderTabs();showActive();refreshStatus();
+}
+window.addEventListener('resize',function(){applyLayout();showActive();});
 function T(u){return u+(u.indexOf('?')<0?'?':'&')+'tab='+encodeURIComponent(active);}
 function label(t){return t.title||host(t.url)||'new tab';}
 function renderTabs(){
-  var h='<span class=\"tab status'+(active==='status'?' on':'')+'\" data-id=status title=\"engine status\">\\u2699 status</span>';
+  var h='<span class=\"tab status'+(active==='status'?' on':'')+(sideOn()?' docked':'')+'\" data-id=status title=\"engine status\">\\u2699 status</span>';
   tabs.forEach(function(t){h+='<span class=\"tab'+(t.id===active?' on':'')+'\" data-id=\"'+t.id+'\"><span class=lbl>'+esc(label(t))+'</span><span class=x data-close=\"'+t.id+'\">\\u00d7</span></span>';});
   h+='<span class=\"tab add\" id=addtab title=\"new tab\">+</span>';
   tabsEl.innerHTML=h;
@@ -238,7 +255,9 @@ tabsEl.onclick=function(e){
   var c=e.target.getAttribute&&e.target.getAttribute('data-close');if(c){closeTab(c);return;}
   if(e.target.id==='addtab'){newTab();return;}
   var el=e.target;while(el&&el!==tabsEl&&!(el.getAttribute&&el.getAttribute('data-id')))el=el.parentNode;
-  var id=el&&el.getAttribute&&el.getAttribute('data-id');if(id)switchTo(id);
+  var id=el&&el.getAttribute&&el.getAttribute('data-id');if(!id)return;
+  if(id==='status'&&sideOn()){toggleSidebar();return;}   // click ⚙ while docked -> undock to a full tab
+  switchTo(id);
 };
 function newTab(){var t={id:newId(),url:'',title:''};tabs.push(t);switchTo(t.id);u.focus();}
 function idx(id){for(var i=0;i<tabs.length;i++)if(tabs[i].id===id)return i;return -1;}
@@ -251,10 +270,12 @@ function closeTab(id){
 }
 function switchTo(id){active=id;save();renderTabs();showActive();}
 function showActive(){
-  if(active==='status'){document.body.classList.add('statusview');refreshStatus();return;}
+  if(active==='status'&&!sideOn()){document.body.classList.add('statusview');refreshStatus();return;}
   document.body.classList.remove('statusview');
+  if(active==='status')active=firstBrowseId();   // docked sidebar: status is on the side, show a page
   var t=tabById(active);u.value=t?t.url:'';
   if(t&&t.url){s.textContent='';reimg();}else{v.removeAttribute('src');s.textContent='new tab — type a URL';}
+  if(sideOn())refreshStatus();
 }
 // ---- navigation (streams progress, then re-images the active tab) ----
 var ti=0,t0=0,pend=null,phase='loading';
@@ -290,7 +311,8 @@ v.onclick=function(e){
 // ---- engine status tab ----
 function fmtUp(sec){var d=Math.floor(sec/86400),h=Math.floor(sec%86400/3600),m=Math.floor(sec%3600/60);return (d?d+'d ':'')+(d||h?h+'h ':'')+m+'m';}
 function renderStatus(d){
-  var h='<h4>engine</h4><div class=srow>uptime '+fmtUp(d.uptime)+' \\u00b7 heap '+d.heapMB+' MB \\u00b7 '+d.tabCount+' tab(s) \\u00b7 '+(d.rendering?('<span style=color:#6cf>rendering '+esc(host(d.rendering))+'</span>'):'idle')+'</div>';
+  var h=isDesk()?('<span class=dock id=dock>'+(sideOn()?'\\u21e5 back to tab':'\\u21e4 dock to sidebar')+'</span>'):'';
+  h+='<h4>engine</h4><div class=srow>uptime '+fmtUp(d.uptime)+' \\u00b7 heap '+d.heapMB+' MB \\u00b7 '+d.tabCount+' tab(s) \\u00b7 '+(d.rendering?('<span style=color:#6cf>rendering '+esc(host(d.rendering))+'</span>'):'idle')+'</div>';
   h+='<h4>open tabs ('+d.tabs.length+')</h4>';
   if(!d.tabs.length)h+='<div class=dim>none</div>';
   d.tabs.forEach(function(t){h+='<div class=srow>'+esc(t.title||host(t.url)||'(blank)')+(t.url?' <span class=dim>\\u2014 '+esc(t.url)+'</span>':'')+'</div>';});
@@ -300,7 +322,8 @@ function renderStatus(d){
   stEl.innerHTML=h;
 }
 function refreshStatus(){fetch('/status.json').then(function(r){return r.json();}).then(renderStatus).catch(function(){stEl.textContent='status unavailable';});}
-setInterval(function(){if(active==='status')refreshStatus();},2000);
+stEl.onclick=function(e){if(e.target.id==='dock')toggleSidebar();};
+setInterval(function(){if(active==='status'||sideOn())refreshStatus();},2000);
 // ---- inspector: performance timeline + network waterfall ----
 function shorten(u){var m=/^https?:\\/\\/([^\\/]*)(.*)$/.exec(u);return m?(m[1]+(m[2]||'/')):u;}
 var KC={document:'#6cf',css:'#9c6',js:'#fc6',image:'#c9f',text:'#8ad',other:'#999'};
@@ -325,7 +348,7 @@ document.getElementById('insp').onclick=function(){if(document.body.classList.to
 document.getElementById('ip').onclick=function(e){if(e.target.className=='close')document.body.classList.remove('showins');};
 // restore each browsing tab's current page from the server (a reload keeps sessions)
 tabs.forEach(function(t){fetch('/go?tab='+encodeURIComponent(t.id)).then(function(r){return r.text();}).then(function(x){var p=x.split('\\n');if(p[0]){t.url=p[0];t.title=(p[1]||'').split('\\u2014')[0].trim();renderTabs();if(t.id===active)showActive();}}).catch(function(){});});
-renderTabs();showActive();
+applyLayout();renderTabs();showActive();
 </script></body></html>"))
 
 (defun %jsesc (s)
