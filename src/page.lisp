@@ -227,12 +227,15 @@
                 (loop for c across (h:dnode-children node) do (demath-dom c))))
     (t (loop for c across (h:dnode-children node) do (demath-dom c)))))
 
-(defun load-page (html &key (css "") (base "") (width 1024) (viewport-height 768) url fragment loader image-loader)
+(defun load-page (html &key (css "") (base "") (width 1024) (viewport-height 768) url fragment loader image-loader cookie-jar)
   "Parse HTML, build a fresh scripting context, run inline <script> and drain the
    initial timer/microtask queue, then render.  Returns a live PAGE.  If the scripts
    leave a degenerate render (SPA hydration cut mid-flight blanks or overlays the page),
-   re-render the original markup without scripts."
-  (let* ((doc (progn (report-progress :parsing)
+   re-render the original markup without scripts.  COOKIE-JAR isolates this browsing
+   context's network identity (default: the ambient jar); every fetch — the main
+   thread and the prefetch workers — uses it."
+  (let* ((fetch:*cookie-jar* (or cookie-jar fetch:*cookie-jar*))   ; bound for the whole render, incl. workers below
+         (doc (progn (report-progress :parsing)
                      (let ((d (h:parse-html html))) (demath-dom d) d)))   ; MathJax LaTeX -> Unicode
          (ssr-text (dom-text-length doc))   ; content the server-rendered markup carries
          ;; prefetch external CSS/JS in parallel before the cascade needs them
@@ -256,7 +259,7 @@
          ;; of faces (nytimes.com), so bound the time spent on them (fallbacks cover
          ;; the rest) rather than stall the render fetching fonts the viewport skips.
          (r:*font-load-budget* *font-load-budget*)
-         (img-threads (start-image-prefetch doc (page-image-loader pg) img-deadline)))
+         (img-threads (start-image-prefetch doc (page-image-loader pg) img-deadline fetch:*cookie-jar*)))
     ;; Run the page's scripts under a wall-clock budget: a raster view doesn't need a
     ;; fully-settled JS app, and some pages spin for seconds.  On timeout — or an
     ;; uncaught script error — we render the DOM as it stands rather than blank the page
@@ -345,10 +348,11 @@
 (defparameter *max-concurrent-fetches* 12
   "Cap on simultaneous subresource connections during a parallel prefetch.")
 
-(defun parallel-fetch (urls)
+(defun parallel-fetch (urls &optional (jar fetch:*cookie-jar*))
   "Fetch URLS concurrently over seal (each its own connection), at most
    *MAX-CONCURRENT-FETCHES* at a time; return a hash-table abs-url -> text (NIL on
-   failure)."
+   failure).  Each worker binds this context's cookie JAR (dynamic bindings don't
+   cross threads) so a subresource's cookies land in the right browsing context."
   (let ((cache (make-hash-table :test 'equal))
         (lock (sb-thread:make-mutex))
         (sem (sb-thread:make-semaphore :count *max-concurrent-fetches*)))
@@ -357,7 +361,8 @@
                               (lambda ()
                                 (sb-thread:wait-on-semaphore sem)
                                 (unwind-protect
-                                    (let* ((st (get-internal-real-time))
+                                    (let* ((fetch:*cookie-jar* jar)
+                                           (st (get-internal-real-time))
                                            (text (handler-case (fetch:fetch-text u) (error () nil))))
                                       (net-log-add u (rel-ms st) (nav-elapsed-ms)
                                                    (and text (length text)) (and text t)
@@ -398,13 +403,14 @@
           (ignore-errors (sb-thread:join-thread th :timeout remaining :default nil))
           (return)))))            ; budget spent: leave the rest running
 
-(defun start-image-prefetch (doc image-loader deadline)
+(defun start-image-prefetch (doc image-loader deadline jar)
   "Spawn concurrent fetches for every network <img>, keyed exactly as layout looks
    them up (R:IMG-SOURCE-URL — the raw src/srcset value FETCH-IMAGE caches under),
    and return the threads.  Meant to run ALONGSIDE the script phase so the bitmaps
    are warm by the time layout needs their dimensions, off the critical path.
-   Each worker binds *IMAGE-LOADER* and the fetch DEADLINE itself (dynamic bindings
-   don't cross threads); FETCH-IMAGE does the caching and honours the deadline."
+   Each worker binds *IMAGE-LOADER*, the fetch DEADLINE, and this context's cookie
+   JAR itself (dynamic bindings don't cross threads) — so a tracking pixel's cookie
+   lands in this browsing context, not a shared jar; FETCH-IMAGE does the caching."
   (let* ((urls (remove-duplicates
                 (loop for n in (css:query-select-all doc "img")
                       for u = (r:img-source-url n)
@@ -417,7 +423,8 @@
                (lambda ()
                  (sb-thread:wait-on-semaphore sem)
                  (unwind-protect
-                     (let ((r:*image-loader* image-loader) (r:*image-fetch-deadline* deadline))
+                     (let ((r:*image-loader* image-loader) (r:*image-fetch-deadline* deadline)
+                           (fetch:*cookie-jar* jar))
                        (ignore-errors (r:fetch-image u)))
                    (sb-thread:signal-semaphore sem)))
                :name "img-prefetch"))
@@ -565,12 +572,15 @@ Returns T when a config was found and applied."
     (when start (push (subseq s start n) out))
     (nreverse out)))
 
-(defun load-url (url-string &key (width 1024) (viewport-height 768))
-  "Fetch and load URL-STRING as a fresh page (the network browsing entry)."
+(defun load-url (url-string &key (width 1024) (viewport-height 768) cookie-jar)
+  "Fetch and load URL-STRING as a fresh page (the network browsing entry).
+   COOKIE-JAR isolates this browsing context (default: the ambient jar); the caller
+   (a tab) supplies its context's jar so identity is per-context, not global."
   ;; Scope the fine network hooks to the MAIN document fetch: the resolve/TLS/
   ;; download detail is for the page itself, not for the many subresources that
   ;; load-page fetches afterward (those are summarized by :loading / :scripting).
-  (let ((st (get-internal-real-time)))
+  (let ((fetch:*cookie-jar* (or cookie-jar fetch:*cookie-jar*))
+        (st (get-internal-real-time)))
    (multiple-value-bind (text charset resp)
       (let ((fetch:*progress* #'report-progress) (seal:*progress* #'report-progress))
         (fetch:fetch-text url-string))
@@ -583,7 +593,8 @@ Returns T when a config was found and applied."
            (frag (and hash (< (1+ hash) (length url-string)) (subseq url-string (1+ hash)))))
       (load-page text :base final :url final :fragment frag
                  :width width :viewport-height viewport-height
-                 :loader (make-http-loader final))))))
+                 :loader (make-http-loader final)
+                 :cookie-jar fetch:*cookie-jar*)))))
 
 (defun load-file (path &key (width 1024) (viewport-height 768))
   "Load a local HTML file as a fresh page (the default/offline browsing entry)."
