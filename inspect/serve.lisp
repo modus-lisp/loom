@@ -243,7 +243,8 @@ function toggleSidebar(){
   applyLayout();save();renderTabs();showActive();refreshStatus();
 }
 window.addEventListener('resize',function(){applyLayout();showActive();});
-function T(u){return u+(u.indexOf('?')<0?'?':'&')+'tab='+encodeURIComponent(active);}
+function T(u){return T2(u,active);}
+function T2(u,id){return u+(u.indexOf('?')<0?'?':'&')+'tab='+encodeURIComponent(id);}
 function label(t){return t.title||host(t.url)||'new tab';}
 function renderTabs(){
   var h='<span class=\"tab status'+(active==='status'?' on':'')+(sideOn()?' docked':'')+'\" data-id=status title=\"engine status\">\\u2699 status</span>';
@@ -286,18 +287,23 @@ function endLoad(){document.body.classList.remove('loading');if(ti){clearInterva
 function failLoad(m){endLoad();s.textContent=m;pend=null;}
 v.onload=function(){endLoad();if(pend!==null){s.textContent=pend;pend=null;}refreshInspector();};
 v.onerror=function(){if(v.getAttribute('src'))failLoad('could not load image');};
-function finalState(url,st){var t=tabById(active);if(t){if(url)t.url=url;t.title=(st||'').split('\\u2014')[0].trim();u.value=t.url;save();renderTabs();}pend=st;reimg();}
-function onLine(ln){if(!ln)return;if(ln.charCodeAt(0)===1){var p=ln.slice(1).split('\\x1f');finalState(p[0]||'',p[1]||'');}else{phase=ln;tick();}}
+// A navigation belongs to the tab that STARTED it (tid), not whatever is active when
+// its stream finishes — so switching tabs mid-load can't cross their state.  The
+// result always updates the owning tab's data; the view only follows if it's showing.
+function finalState(url,st,tid){var t=tabById(tid);if(t){if(url)t.url=url;t.title=(st||'').split('\\u2014')[0].trim();save();renderTabs();}
+  if(tid===active){u.value=(t?t.url:'');pend=st;reimg();}}
+function onLine(ln,tid){if(!ln)return;if(ln.charCodeAt(0)===1){var p=ln.slice(1).split('\\x1f');finalState(p[0]||'',p[1]||'',tid);}else if(tid===active){phase=ln;tick();}}
 function stream(endpoint,p){
+  var tid=active;                    // capture the owning tab id up front
   startLoad(p);
-  fetch(T(endpoint)).then(function(r){
-    if(!r.body||!r.body.getReader){return r.text().then(function(t){t.split('\\n').forEach(onLine);});}
+  fetch(T2(endpoint,tid)).then(function(r){
+    if(!r.body||!r.body.getReader){return r.text().then(function(t){t.split('\\n').forEach(function(l){onLine(l,tid);});});}
     var rd=r.body.getReader(),dec=new TextDecoder(),buf='';
     return (function pump(){return rd.read().then(function(res){
-      if(res.value){buf+=dec.decode(res.value,{stream:true});var a=buf.split('\\n');buf=a.pop();a.forEach(onLine);}
-      if(res.done){if(buf)onLine(buf);return;}
+      if(res.value){buf+=dec.decode(res.value,{stream:true});var a=buf.split('\\n');buf=a.pop();a.forEach(function(l){onLine(l,tid);});}
+      if(res.done){if(buf)onLine(buf,tid);return;}
       return pump();});})();
-  }).catch(function(){failLoad('network error');});
+  }).catch(function(){if(tid===active)failLoad('network error');});
 }
 document.getElementById('bar').onsubmit=function(e){e.preventDefault();var val=u.value.trim();if(!val||active==='status')return;stream('/go?url='+encodeURIComponent(val),'connecting');};
 document.getElementById('flag').onclick=function(){fetch(T('/flag')).then(function(r){return r.text();}).then(function(t){s.textContent=t;}).catch(function(){s.textContent='network error';});};
