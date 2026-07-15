@@ -41,6 +41,20 @@
   (let ((id (if (and (stringp id) (plusp (length id))) id "0")))
     (sb-thread:with-mutex (*tabs-lock*)
       (or (gethash id *tabs*) (setf (gethash id *tabs*) (make-tab))))))
+(defun drop-tab (id)
+  "Forget a closed tab (its page, context and cookie jar are released)."
+  (when (and (stringp id) (plusp (length id)))
+    (sb-thread:with-mutex (*tabs-lock*) (remhash id *tabs*))))
+
+;;; ---- engine status (the pinned status tab reads this) ---------------------
+(defvar *start-time* (get-universal-time) "When the server booted (for uptime).")
+(defvar *rendering* nil "URL the (single, lock-serialized) active render is on, or NIL.")
+(defvar *recent-errors* '() "In-memory ring of recent (universal-time kind url detail) for the status view.")
+(defvar *recent-lock* (sb-thread:make-mutex :name "recent"))
+(defun note-error (kind url detail)
+  (sb-thread:with-mutex (*recent-lock*)
+    (push (list (get-universal-time) (string kind) (or url "") (princ-to-string detail)) *recent-errors*)
+    (when (> (length *recent-errors*) 50) (setf *recent-errors* (subseq *recent-errors* 0 50)))))
 
 ;;; The server is threaded (one thread per connection) so a slow render doesn't
 ;;; freeze the whole service — read requests (/view.png, /, status) are answered
@@ -89,6 +103,7 @@
 
 (defun log-error (kind url detail)
   "Record one error row.  Never signals — logging must not break a request."
+  (ignore-errors (note-error kind url detail))
   (ignore-errors
     (format *error-output* "~&[errlog] ~a ~a: ~a~%" kind (or url "") detail)
     (errlog-exec (format nil "INSERT INTO errors (kind,url,detail) VALUES (~a,~a,~a)"
@@ -151,15 +166,24 @@
 
 ;;; ---- the client -----------------------------------------------------------
 (defun client-html ()
-  ;; Navigation is driven by the URL hash so the browser Back/Forward buttons work:
-  ;; the address bar and link clicks set location.hash, and a hashchange handler (which
-  ;; also fires on Back/Forward) renders that URL.  The raster/status are fetched, not
-  ;; embedded, so a hash change is one history entry without a full page reload.
+  ;; A tab bar at the top holds a pinned \"status\" tab (engine status) plus one
+  ;; browsing tab per open page.  Each browsing tab is its own server session and
+  ;; browsing context (own cookies); its id is sent on every request.  Tabs persist
+  ;; in sessionStorage so a reload keeps them.
   (format nil "<!doctype html><html><head><meta charset=\"utf-8\"><title>weft</title>
 <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">
 <script>document.cookie='vw='+Math.round(window.innerWidth)+';path=/;max-age=31536000';</script>
 <style>body{margin:0;font:14px sans-serif;background:#222;color:#eee}
-#bar{position:sticky;top:0;background:#333;padding:6px;display:flex;gap:6px;z-index:9}
+#hdr{position:sticky;top:0;z-index:10;background:#2a2a2a}
+#tabs{display:flex;gap:2px;padding:5px 5px 0;overflow-x:auto;white-space:nowrap;scrollbar-width:thin}
+#tabs .tab{display:inline-flex;align-items:center;gap:6px;padding:5px 9px;background:#363636;color:#bbb;border-radius:7px 7px 0 0;cursor:pointer;font-size:12px;max-width:190px;flex:none}
+#tabs .tab.on{background:#444;color:#fff}
+#tabs .tab .lbl{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+#tabs .tab .x{color:#888;font-weight:bold;padding:0 1px;border-radius:3px}
+#tabs .tab .x:hover{color:#fff;background:#a44}
+#tabs .status{background:#293a29;color:#9c9}#tabs .status.on{background:#3a4a3a;color:#cfc}
+#tabs .add{background:transparent;color:#9c9;font-size:16px;padding:2px 11px}#tabs .add:hover{color:#fff}
+#bar{background:#333;padding:6px;display:flex;gap:6px}
 #bar input{flex:1;padding:5px;font-size:16px;min-width:0}#bar button{padding:5px 12px}
 #s{padding:4px 8px;color:#9c9;font-size:12px}#v{display:block;width:100%;height:auto;background:#fff}
 #p{position:fixed;top:0;left:0;right:0;height:3px;overflow:hidden;z-index:20;display:none}
@@ -168,6 +192,11 @@ body.loading #p{display:block}
 @keyframes sl{0%{left:-42%}100%{left:100%}}
 body.loading #v{opacity:.5;transition:opacity .15s}
 body.loading #s{color:#6cf}
+#st{display:none;padding:12px 14px;font:12px/1.7 ui-monospace,monospace;color:#cdc}
+#st h4{margin:14px 0 4px;color:#6cf;font-weight:normal;border-bottom:1px solid #333;padding-bottom:3px}
+#st .srow{padding:2px 0;overflow-wrap:anywhere}#st .k{color:#e88}#st .dim{color:#888}#st .det{color:#aaa;padding-left:10px}
+body.statusview #bar,body.statusview #v,body.statusview #s{display:none}
+body.statusview #st{display:block}
 #ip{display:none;position:fixed;left:0;right:0;bottom:0;z-index:30;padding:8px 10px;background:rgba(20,20,20,.96);color:#ccc;font:11px/1.5 ui-monospace,monospace;max-height:62vh;overflow:auto;border-top:1px solid #444;box-shadow:0 -3px 14px rgba(0,0,0,.6)}
 body.showins #ip{display:block}
 #ip .close{position:sticky;top:0;float:right;color:#9c9;cursor:pointer;padding:0 4px}
@@ -177,44 +206,67 @@ body.showins #ip{display:block}
 #ip .lbl{width:160px;flex:none;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 #ip .track{flex:1;position:relative;height:9px;background:#242424;border-radius:2px}
 #ip .bar{position:absolute;height:100%;background:#6cf;border-radius:2px}
-#ip .barf{position:absolute;height:100%;background:#e66;border-radius:2px}
 #ip .ms{width:96px;flex:none;text-align:right;color:#8a8}</style></head>
-<body><div id=p></div><form id=bar novalidate><input id=u placeholder=\"https://…\" type=\"url\" inputmode=\"url\" autocapitalize=\"none\" autocorrect=\"off\" spellcheck=\"false\">
-<button type=submit>Go</button><button type=button id=flag title=\"flag this page as broken\">&#9873;</button><button type=button id=insp title=\"inspector\">&#9201;</button></form><div id=s></div>
-<img id=v>
-<div id=ip></div>
+<body><div id=p></div>
+<div id=hdr><div id=tabs></div>
+<form id=bar novalidate><input id=u placeholder=\"https://…\" type=\"url\" inputmode=\"url\" autocapitalize=\"none\" autocorrect=\"off\" spellcheck=\"false\">
+<button type=submit>Go</button><button type=button id=flag title=\"flag this page as broken\">&#9873;</button><button type=button id=insp title=\"inspector\">&#9201;</button></form></div>
+<div id=s></div><img id=v><div id=st></div><div id=ip></div>
 <script>
-var v=document.getElementById('v'),u=document.getElementById('u'),s=document.getElementById('s');
-// A per-browser-tab id (sessionStorage is per tab), so each tab is its own server
-// session/context; every request carries it.  Cleared cookies can't merge tabs.
-var TAB=sessionStorage.getItem('loomtab')||(Date.now().toString(36)+Math.random().toString(36).slice(2,8));
-sessionStorage.setItem('loomtab',TAB);
-function T(u){return u+(u.indexOf('?')<0?'?':'&')+'tab='+encodeURIComponent(TAB);}
-var serverUrl='';                   // the URL this tab currently has rendered
-u.value=serverUrl; s.textContent='';
-var ti=0,t0=0,pend=null,phase='loading';   // timer handle, load start (ms), status to show once the image lands, current phase
-function hurl(){return decodeURIComponent(location.hash.slice(1));}
+var v=document.getElementById('v'),u=document.getElementById('u'),s=document.getElementById('s'),
+    tabsEl=document.getElementById('tabs'),stEl=document.getElementById('st');
+function newId(){return Date.now().toString(36)+Math.random().toString(36).slice(2,8);}
+function esc(x){return String(x).replace(/[&<>]/g,function(c){return c=='&'?'&amp;':c=='<'?'&lt;':'&gt;';});}
+function host(x){var m=/^https?:\\/\\/([^\\/]*)/.exec(x||'');return m?m[1]:(x||'');}
+// ---- tabs: [{id,url,title}] + a pinned 'status' pseudo-tab; persisted per browser tab
+var tabs,active;
+try{tabs=JSON.parse(sessionStorage.getItem('loomtabs'))||[];}catch(e){tabs=[];}
+active=sessionStorage.getItem('loomactive')||null;
+if(!tabs.length){tabs=[{id:newId(),url:'',title:''}];active=tabs[0].id;}
+if(active!=='status'&&!tabs.some(function(t){return t.id===active;}))active=tabs[0].id;
+function save(){try{sessionStorage.setItem('loomtabs',JSON.stringify(tabs));sessionStorage.setItem('loomactive',active);}catch(e){}}
+function tabById(id){for(var i=0;i<tabs.length;i++)if(tabs[i].id===id)return tabs[i];return null;}
+function T(u){return u+(u.indexOf('?')<0?'?':'&')+'tab='+encodeURIComponent(active);}
+function label(t){return t.title||host(t.url)||'new tab';}
+function renderTabs(){
+  var h='<span class=\"tab status'+(active==='status'?' on':'')+'\" data-id=status title=\"engine status\">\\u2699 status</span>';
+  tabs.forEach(function(t){h+='<span class=\"tab'+(t.id===active?' on':'')+'\" data-id=\"'+t.id+'\"><span class=lbl>'+esc(label(t))+'</span><span class=x data-close=\"'+t.id+'\">\\u00d7</span></span>';});
+  h+='<span class=\"tab add\" id=addtab title=\"new tab\">+</span>';
+  tabsEl.innerHTML=h;
+}
+tabsEl.onclick=function(e){
+  var c=e.target.getAttribute&&e.target.getAttribute('data-close');if(c){closeTab(c);return;}
+  if(e.target.id==='addtab'){newTab();return;}
+  var el=e.target;while(el&&el!==tabsEl&&!(el.getAttribute&&el.getAttribute('data-id')))el=el.parentNode;
+  var id=el&&el.getAttribute&&el.getAttribute('data-id');if(id)switchTo(id);
+};
+function newTab(){var t={id:newId(),url:'',title:''};tabs.push(t);switchTo(t.id);u.focus();}
+function idx(id){for(var i=0;i<tabs.length;i++)if(tabs[i].id===id)return i;return -1;}
+function closeTab(id){
+  fetch('/close?tab='+encodeURIComponent(id)).catch(function(){});
+  var i=idx(id);if(i<0)return;tabs.splice(i,1);
+  if(!tabs.length)tabs=[{id:newId(),url:'',title:''}];
+  if(active===id)active=(tabs[Math.max(0,i-1)]||tabs[0]).id;
+  save();renderTabs();showActive();
+}
+function switchTo(id){active=id;save();renderTabs();showActive();}
+function showActive(){
+  if(active==='status'){document.body.classList.add('statusview');refreshStatus();return;}
+  document.body.classList.remove('statusview');
+  var t=tabById(active);u.value=t?t.url:'';
+  if(t&&t.url){s.textContent='';reimg();}else{v.removeAttribute('src');s.textContent='new tab — type a URL';}
+}
+// ---- navigation (streams progress, then re-images the active tab) ----
+var ti=0,t0=0,pend=null,phase='loading';
 function reimg(){v.src=T('/view.png?g='+Date.now());}
-// A navigation streams phase lines (fetching, parsing, rendering, …) then a final
-// line (SOH url US status).  Show each phase live with an elapsed counter, and hold
-// the busy state from the tap until the freshly-encoded image actually loads.
-function tick(){s.textContent=phase+'… '+((Date.now()-t0)/1000).toFixed(1)+'s';}
+function tick(){s.textContent=phase+'\\u2026 '+((Date.now()-t0)/1000).toFixed(1)+'s';}
 function startLoad(p){phase=p||'loading';document.body.classList.add('loading');t0=Date.now();tick();if(!ti)ti=setInterval(tick,200);}
 function endLoad(){document.body.classList.remove('loading');if(ti){clearInterval(ti);ti=0;}}
 function failLoad(m){endLoad();s.textContent=m;pend=null;}
 v.onload=function(){endLoad();if(pend!==null){s.textContent=pend;pend=null;}refreshInspector();};
-v.onerror=function(){failLoad('could not load image');};
-function finalState(url,st){
-  if(url){serverUrl=url;u.value=url;pend=st;var enc=encodeURIComponent(url);
-    if(location.hash.slice(1)!==enc){location.hash=enc;return;}}   // hash change -> render() reimgs
-  else pend=st;
-  reimg();
-}
-function onLine(ln){
-  if(!ln)return;
-  if(ln.charCodeAt(0)===1){var p=ln.slice(1).split('\\x1f');finalState(p[0]||'',p[1]||'');}
-  else{phase=ln;tick();}
-}
+v.onerror=function(){if(v.getAttribute('src'))failLoad('could not load image');};
+function finalState(url,st){var t=tabById(active);if(t){if(url)t.url=url;t.title=(st||'').split('\\u2014')[0].trim();u.value=t.url;save();renderTabs();}pend=st;reimg();}
+function onLine(ln){if(!ln)return;if(ln.charCodeAt(0)===1){var p=ln.slice(1).split('\\x1f');finalState(p[0]||'',p[1]||'');}else{phase=ln;tick();}}
 function stream(endpoint,p){
   startLoad(p);
   fetch(T(endpoint)).then(function(r){
@@ -223,23 +275,33 @@ function stream(endpoint,p){
     return (function pump(){return rd.read().then(function(res){
       if(res.value){buf+=dec.decode(res.value,{stream:true});var a=buf.split('\\n');buf=a.pop();a.forEach(onLine);}
       if(res.done){if(buf)onLine(buf);return;}
-      return pump();
-    });})();
+      return pump();});})();
   }).catch(function(){failLoad('network error');});
 }
-function render(){var h=hurl();if(!h)return;u.value=h;if(h===serverUrl){reimg();return;}stream('/go?url='+encodeURIComponent(h),'connecting');}
-window.addEventListener('hashchange',render);
-document.getElementById('bar').onsubmit=function(e){e.preventDefault();var t=u.value.trim();if(!t)return;var enc=encodeURIComponent(t);if(location.hash.slice(1)===enc)render();else location.hash=enc;};
+document.getElementById('bar').onsubmit=function(e){e.preventDefault();var val=u.value.trim();if(!val||active==='status')return;stream('/go?url='+encodeURIComponent(val),'connecting');};
 document.getElementById('flag').onclick=function(){fetch(T('/flag')).then(function(r){return r.text();}).then(function(t){s.textContent=t;}).catch(function(){s.textContent='network error';});};
 v.onclick=function(e){
-  if(document.body.classList.contains('loading'))return;   // busy — ignore taps rather than queue them
+  if(document.body.classList.contains('loading'))return;
   var r=v.getBoundingClientRect();
   var x=Math.round((e.clientX-r.left)*(v.naturalWidth/r.width));
   var y=Math.round((e.clientY-r.top)*(v.naturalHeight/r.height));
   stream('/click?x='+x+'&y='+y,'opening');
 };
+// ---- engine status tab ----
+function fmtUp(sec){var d=Math.floor(sec/86400),h=Math.floor(sec%86400/3600),m=Math.floor(sec%3600/60);return (d?d+'d ':'')+(d||h?h+'h ':'')+m+'m';}
+function renderStatus(d){
+  var h='<h4>engine</h4><div class=srow>uptime '+fmtUp(d.uptime)+' \\u00b7 heap '+d.heapMB+' MB \\u00b7 '+d.tabCount+' tab(s) \\u00b7 '+(d.rendering?('<span style=color:#6cf>rendering '+esc(host(d.rendering))+'</span>'):'idle')+'</div>';
+  h+='<h4>open tabs ('+d.tabs.length+')</h4>';
+  if(!d.tabs.length)h+='<div class=dim>none</div>';
+  d.tabs.forEach(function(t){h+='<div class=srow>'+esc(t.title||host(t.url)||'(blank)')+(t.url?' <span class=dim>\\u2014 '+esc(t.url)+'</span>':'')+'</div>';});
+  h+='<h4>recent errors ('+d.errors.length+')</h4>';
+  if(!d.errors.length)h+='<div class=dim>none</div>';
+  d.errors.forEach(function(e){h+='<div class=srow><span class=k>'+esc(e.kind)+'</span> '+esc(host(e.url))+' <span class=dim>'+e.ago+'s ago</span>'+(e.detail?'<div class=det>'+esc(e.detail)+'</div>':'')+'</div>';});
+  stEl.innerHTML=h;
+}
+function refreshStatus(){fetch('/status.json').then(function(r){return r.json();}).then(renderStatus).catch(function(){stEl.textContent='status unavailable';});}
+setInterval(function(){if(active==='status')refreshStatus();},2000);
 // ---- inspector: performance timeline + network waterfall ----
-function esc(s){return String(s).replace(/[&<>]/g,function(c){return c=='&'?'&amp;':c=='<'?'&lt;':'&gt;';});}
 function shorten(u){var m=/^https?:\\/\\/([^\\/]*)(.*)$/.exec(u);return m?(m[1]+(m[2]||'/')):u;}
 var KC={document:'#6cf',css:'#9c6',js:'#fc6',image:'#c9f',text:'#8ad',other:'#999'};
 function ibar(color,left,w){return '<span class=bar style=left:'+left.toFixed(2)+'%;width:'+Math.max(0.4,w).toFixed(2)+'%;background:'+color+'></span>';}
@@ -247,26 +309,23 @@ function sz(b){return b>=1024?Math.round(b/1024)+'k':b+'b';}
 function renderInspector(d){
   var done=d.phases.length?d.phases[d.phases.length-1].at:0,ne=0;
   d.network.forEach(function(n){if(n.end>ne)ne=n.end;});
-  var total=Math.max(done,ne,1),h='<span class=close>✕</span>';
-  h+='<div class=sum>'+(done/1000).toFixed(2)+'s · '+d.width+'×'+d.contentHeight+' · '+d.elements+' els · '+d.links+' links · '+d.images+' imgs'+(d.jsError?' · <span style=color:#e66>JS: '+esc(d.jsError)+'</span>':'')+'</div>';
+  var total=Math.max(done,ne,1),h='<span class=close>\\u2715</span>';
+  h+='<div class=sum>'+(done/1000).toFixed(2)+'s \\u00b7 '+d.width+'\\u00d7'+d.contentHeight+' \\u00b7 '+d.elements+' els \\u00b7 '+d.links+' links \\u00b7 '+d.images+' imgs'+(d.jsError?' \\u00b7 <span style=color:#e66>JS: '+esc(d.jsError)+'</span>':'')+'</div>';
   h+='<h4>timeline</h4>';
   for(var i=0;i<d.phases.length-1;i++){var p=d.phases[i],dur=d.phases[i+1].at-p.at;
     h+='<div class=row><span class=lbl>'+esc(p.label)+'</span><span class=track>'+ibar('#6cf',100*p.at/total,100*dur/total)+'</span><span class=ms>'+dur+'ms</span></div>';}
   h+='<h4>network ('+d.network.length+')</h4>';
-  if(d.byKind){var parts=[];for(var k in d.byKind){var b=d.byKind[k];parts.push('<span style=color:'+(KC[k]||'#999')+'>'+k+'</span> '+b.count+'× '+sz(b.bytes)+' '+b.ms+'ms');}h+='<div class=sum>'+parts.join('   ')+'</div>';}
+  if(d.byKind){var parts=[];for(var k in d.byKind){var b=d.byKind[k];parts.push('<span style=color:'+(KC[k]||'#999')+'>'+k+'</span> '+b.count+'\\u00d7 '+sz(b.bytes)+' '+b.ms+'ms');}h+='<div class=sum>'+parts.join('   ')+'</div>';}
   d.network.forEach(function(n){var dur=n.end-n.start,c=n.ok?(KC[n.kind]||'#6cf'):'#e66';
-    h+='<div class=row><span class=lbl>'+esc(shorten(n.url))+'</span><span class=track>'+ibar(c,100*n.start/total,100*dur/total)+'</span><span class=ms>'+dur+'ms · '+sz(n.bytes)+'</span></div>';});
+    h+='<div class=row><span class=lbl>'+esc(shorten(n.url))+'</span><span class=track>'+ibar(c,100*n.start/total,100*dur/total)+'</span><span class=ms>'+dur+'ms \\u00b7 '+sz(n.bytes)+'</span></div>';});
   document.getElementById('ip').innerHTML=h;
 }
-function refreshInspector(){if(document.body.classList.contains('showins'))fetch(T('/inspect.json')).then(function(r){return r.json();}).then(renderInspector).catch(function(){});}
+function refreshInspector(){if(document.body.classList.contains('showins')&&active!=='status')fetch(T('/inspect.json')).then(function(r){return r.json();}).then(renderInspector).catch(function(){});}
 document.getElementById('insp').onclick=function(){if(document.body.classList.toggle('showins'))refreshInspector();};
 document.getElementById('ip').onclick=function(e){if(e.target.className=='close')document.body.classList.remove('showins');};
-// Restore THIS tab's current page (a reload keeps the same server session/context)
-// without re-navigating — set serverUrl first so the hashchange just re-images.
-function restore(){fetch(T('/go')).then(function(r){return r.text();}).then(function(t){
-  var p=t.split('\\n');if(p[0]){serverUrl=p[0];u.value=p[0];s.textContent=p[1]||'';
-    var enc=encodeURIComponent(p[0]);if(location.hash.slice(1)!==enc)location.hash=enc;else reimg();}}).catch(function(){});}
-if(hurl())render(); else restore();
+// restore each browsing tab's current page from the server (a reload keeps sessions)
+tabs.forEach(function(t){fetch('/go?tab='+encodeURIComponent(t.id)).then(function(r){return r.text();}).then(function(x){var p=x.split('\\n');if(p[0]){t.url=p[0];t.title=(p[1]||'').split('\\u2014')[0].trim();renderTabs();if(t.id===active)showActive();}}).catch(function(){});});
+renderTabs();showActive();
 </script></body></html>"))
 
 (defun %jsesc (s)
@@ -444,6 +503,38 @@ Returns (values out encoding-or-nil)."
                                (%json-str "count") cnt (%json-str "bytes") kb (%json-str "ms") ms)))
             (format o "}}")))))))
 
+(defun status-json ()
+  "Engine status for the pinned status tab: uptime, the active render, open tabs
+   (id/url/title) and recent errors."
+  (let ((tabs (sb-thread:with-mutex (*tabs-lock*)
+                (loop for id being the hash-keys of *tabs* using (hash-value tb)
+                      collect (list id (or (and (tab-page tb) (l:page-url (tab-page tb))) "")
+                                    (or (and (tab-page tb) (l:page-title (tab-page tb))) "")))))
+        (errs (sb-thread:with-mutex (*recent-lock*)
+                (subseq *recent-errors* 0 (min 20 (length *recent-errors*)))))
+        (now (get-universal-time)))
+    (with-output-to-string (o)
+      (flet ((kv (k v) (format o "~a:~a," (%json-str k) v)))
+        (write-char #\{ o)
+        (kv "uptime" (- now *start-time*))
+        (kv "rendering" (if *rendering* (%json-str *rendering*) "null"))
+        (kv "heapMB" (or (ignore-errors (round (/ (sb-kernel:dynamic-usage) 1048576))) 0))
+        (kv "tabCount" (length tabs))
+        (format o "~a:[" (%json-str "tabs"))
+        (loop for (id url title) in tabs for i from 0
+              do (when (plusp i) (write-char #\, o))
+                 (format o "{~a:~a,~a:~a,~a:~a}" (%json-str "id") (%json-str id)
+                         (%json-str "url") (%json-str url) (%json-str "title") (%json-str title)))
+        (format o "],~a:[" (%json-str "errors"))
+        (loop for (ut kind url detail) in errs for i from 0
+              do (when (plusp i) (write-char #\, o))
+                 (format o "{~a:~d,~a:~a,~a:~a,~a:~a}"
+                         (%json-str "ago") (- now ut)
+                         (%json-str "kind") (%json-str kind)
+                         (%json-str "url") (%json-str url)
+                         (%json-str "detail") (%json-str detail)))
+        (format o "]}")))))
+
 (defun run-streamed (stream tab thunk)
   "Stream THUNK's progress: emit each phase, force the PNG encode (so the follow-up
    /view.png is instant), then TAB's final state line.  Also captures the phase
@@ -521,17 +612,28 @@ Returns (values out encoding-or-nil)."
        (let ((url (query-param query "url")))
          (if (and url (plusp (length url)))
              (sb-thread:with-mutex (*render-lock*)   ; one render at a time (shared caches)
-               (run-streamed stream tab (lambda () (navigate-tab tab url :fresh t))))
+               (setf *rendering* url)
+               (unwind-protect
+                   (run-streamed stream tab (lambda () (navigate-tab tab url :fresh t)))
+                 (setf *rendering* nil)))
              (send stream "200 OK" "text/plain; charset=utf-8" (tab-state-text tab)))))
       ((string= path "/inspect.json")
        (send stream "200 OK" "application/json; charset=utf-8" (inspect-json tab)))
+      ((string= path "/status.json")
+       (send stream "200 OK" "application/json; charset=utf-8" (status-json)))
+      ((string= path "/close")
+       (drop-tab (query-param query "tab"))
+       (send stream "200 OK" "text/plain; charset=utf-8" "closed"))
       ((string= path "/click")
        ;; a click may follow a link — the page's on-navigate re-navigates THIS tab in
        ;; the SAME context (:fresh nil), so a login/session carries across the click.
        (let ((x (ignore-errors (parse-integer (or (query-param query "x") "0"))))
              (y (ignore-errors (parse-integer (or (query-param query "y") "0")))))
          (sb-thread:with-mutex (*render-lock*)
-           (run-streamed stream tab (lambda () (when (and x y) (click-tab tab x y)))))))
+           (setf *rendering* (or (and (tab-page tab) (l:page-url (tab-page tab))) "click"))
+           (unwind-protect
+               (run-streamed stream tab (lambda () (when (and x y) (click-tab tab x y))))
+             (setf *rendering* nil)))))
       ((string= path "/flag")
        (let ((u (or (and (tab-page tab) (l:page-url (tab-page tab))) (query-param query "url"))))
          (when (and u (plusp (length u)))
