@@ -252,6 +252,10 @@
          (img-deadline (+ (get-internal-real-time)
                           (round (* *image-prefetch-budget* internal-time-units-per-second))))
          (r:*image-fetch-deadline* img-deadline)
+         ;; @font-face fetches are serial; a script-built sheet can declare hundreds
+         ;; of faces (nytimes.com), so bound the time spent on them (fallbacks cover
+         ;; the rest) rather than stall the render fetching fonts the viewport skips.
+         (r:*font-load-budget* *font-load-budget*)
          (img-threads (start-image-prefetch doc (page-image-loader pg) img-deadline)))
     ;; Run the page's scripts under a wall-clock budget: a raster view doesn't need a
     ;; fully-settled JS app, and some pages spin for seconds.  On timeout — or an
@@ -367,6 +371,11 @@
    to a new host pays a CPU-bound pure-CL TLS handshake, and flooding both starves
    the cores and defeats keep-alive connection reuse, so a wide fan-out is slower
    than a handful of reusing workers.")
+
+(defparameter *font-load-budget* 5.0
+  "Seconds a render may spend fetching @font-face web fonts before falling back for
+   the rest (see WEFT.RENDER:*FONT-LOAD-BUDGET*).  Bounds a page that injects a huge
+   font sheet (nytimes.com) without hurting a page with a handful of real fonts.")
 
 (defparameter *image-prefetch-budget* 12.0
   "Seconds (from prefetch start) the render will wait for <img> bitmaps before
