@@ -15,15 +15,32 @@
 
 (defpackage #:weft-serve
   (:use #:cl)
-  (:local-nicknames (#:l #:loom) (#:r #:weft.render) (#:sock #:sb-bsd-sockets)))
+  (:local-nicknames (#:l #:loom) (#:r #:weft.render) (#:fetch #:weft.fetch) (#:sock #:sb-bsd-sockets)))
 (in-package #:weft-serve)
 
-(defvar *page* nil "The single live browsing session (MVP: one shared page).")
-(defvar *status* "type a URL and press Go")
-(defvar *gen* 0 "Bumped every render so the client's <img> cache-busts.")
-(defvar *render-width* 1024
-  "Layout width pages are rendered at — driven by the client's viewport width (a `vw`
-   cookie) so mobile gets a readable device-width render instead of a shrunk 1024px page.")
+;;; A browsing CONTEXT (BCTX) is an isolated network identity — its own cookie jar.
+;;; A TAB is a client-visible session pointing at a context and its current render.
+;;; A freshly typed URL opens a NEW context, so a site can't be re-identified across
+;;; visits; following a link keeps the tab's context (and a popup would share its
+;;; opener's — future).  Tabs are keyed by an id the client mints per browser tab
+;;; (sessionStorage), defaulting to "0" for a client that doesn't send one.
+(defstruct bctx (jar (fetch:make-cookie-jar)))
+(defstruct tab
+  (bctx (make-bctx))
+  (page nil)
+  (status "type a URL and press Go")
+  (gen 0)                  ; bumped per render so the client's <img> cache-busts
+  (width 1024)             ; layout width (the client's viewport `vw`)
+  (png nil) (png-gen -1)   ; per-gen PNG encode cache
+  (timeline nil))          ; last navigation's phase timeline (inspector)
+
+(defvar *tabs* (make-hash-table :test 'equal) "client tab-id -> TAB")
+(defvar *tabs-lock* (sb-thread:make-mutex :name "tabs"))
+(defun tab-for (id)
+  "The TAB for client ID (minted per browser tab), created on first use."
+  (let ((id (if (and (stringp id) (plusp (length id))) id "0")))
+    (sb-thread:with-mutex (*tabs-lock*)
+      (or (gethash id *tabs*) (setf (gethash id *tabs*) (make-tab))))))
 
 ;;; The server is threaded (one thread per connection) so a slow render doesn't
 ;;; freeze the whole service — read requests (/view.png, /, status) are answered
@@ -79,57 +96,58 @@
                          (%sqlq (princ-to-string detail))))))
 
 ;;; ---- browsing -------------------------------------------------------------
-(defun follow (target)
-  "on-navigate callback: load TARGET as the new page (keeps the callback)."
-  (navigate target))
-
-(defun navigate (url)
+(defun navigate-tab (tab url &key (fresh t))
+  "Load URL into TAB.  FRESH (a typed URL / address-bar open) starts a NEW browsing
+   context so the visit shares no cookies with a previous one; following a link
+   (FRESH NIL, via the page's on-navigate) keeps the tab's context.  Every fetch
+   uses that context's cookie jar."
+  (when fresh (setf (tab-bctx tab) (make-bctx)))
   ;; Render at the client's own width; height comes from content flow (reader view).
-  ;; The only exception is a page that clips at the root (a viewport-model page like
+  ;; The exception is a page that clips at the root (a viewport-model page like
   ;; Acid2): it gets a fixed viewport whose height is a 4:3 slice of that width.
-  (let ((vph (max 480 (round (* *render-width* 3/4)))))
+  (let ((vph (max 480 (round (* (tab-width tab) 3/4))))
+        (jar (bctx-jar (tab-bctx tab)))
+        (u (if (or (search "://" url) (eql 0 (search "http" url))) url
+               (concatenate 'string "https://" url))))
    (handler-case
-      (let ((pg (if (or (search "://" url) (eql 0 (search "http" url)))
-                    (l:load-url url :width *render-width* :viewport-height vph)
-                    (l:load-url (concatenate 'string "https://" url)
-                                :width *render-width* :viewport-height vph))))
-        (setf (l:page-on-navigate pg) (lambda (p tgt) (declare (ignore p)) (follow tgt)))
-        ;; the page rendered, but record a non-fatal script error for observability
+      (let ((pg (l:load-url u :width (tab-width tab) :viewport-height vph :cookie-jar jar)))
+        ;; a link followed inside this tab stays in the same context (fresh nil)
+        (setf (l:page-on-navigate pg)
+              (lambda (p tgt) (declare (ignore p)) (navigate-tab tab tgt :fresh nil)))
         (when (l:page-js-error pg) (log-error "script" url (l:page-js-error pg)))
-        (setf *page* pg
-              *status* (format nil "~a  —  ~a" (or (l:page-title pg) "") (or (l:page-url pg) url)))
-        (incf *gen*))
+        (setf (tab-page tab) pg
+              (tab-status tab) (format nil "~a  —  ~a" (or (l:page-title pg) "") (or (l:page-url pg) url)))
+        (incf (tab-gen tab)))
     (error (e)
       (log-error "navigate" url e)
-      (setf *status* (format nil "couldn't load ~a  (~a)" url e))))))
+      (setf (tab-status tab) (format nil "couldn't load ~a  (~a)" url e))))))
 
-(defvar *png-cache* nil)
-(defvar *png-cache-gen* -1)
-(defun page-png-bytes ()
-  "Encode the current page canvas to a compressed PNG in memory, cached per *GEN* — the
-   DEFLATE encode costs seconds on a tall page, so encode once per navigation, not per
-   /view.png request.  No temp file, so a full disk can't break rendering.  Thread-safe:
-   a /view.png reader encodes the CURRENT page (snapshotted) while another thread renders
-   the next one; the cache update is serialized on *PNG-LOCK*."
-  (let ((pg *page*) (gen *gen*))          ; snapshot so a concurrent swap can't tear the encode
+(defun tab-png-bytes (tab)
+  "Encode TAB's current page canvas to a compressed PNG, cached per its GEN — the
+   DEFLATE encode costs seconds on a tall page, so encode once per navigation, not
+   per /view.png.  Thread-safe: a /view.png reader encodes the CURRENT page (fields
+   snapshotted) while another thread renders the next; the update is on *PNG-LOCK*."
+  (let ((pg (tab-page tab)) (gen (tab-gen tab)))
     (when pg
       (sb-thread:with-mutex (*png-lock*)
-        (unless (and *png-cache* (= *png-cache-gen* gen))
-          (setf *png-cache* (coerce (r:canvas->png (l:page-canvas pg)) '(simple-array (unsigned-byte 8) (*)))
-                *png-cache-gen* gen))
-        *png-cache*))))
+        (unless (and (tab-png tab) (= (tab-png-gen tab) gen))
+          (setf (tab-png tab) (coerce (r:canvas->png (l:page-canvas pg)) '(simple-array (unsigned-byte 8) (*)))
+                (tab-png-gen tab) gen))
+        (tab-png tab)))))
 
-(defun state-text ()
-  "The client-facing page state: current URL on the first line, status on the second."
-  (format nil "~a~%~a" (or (and *page* (l:page-url *page*)) "") (or *status* "")))
+(defun tab-state-text (tab)
+  "The client-facing tab state: current URL on the first line, status on the second."
+  (format nil "~a~%~a" (or (and (tab-page tab) (l:page-url (tab-page tab))) "") (or (tab-status tab) "")))
 
-(defun handle-click (x y)
-  "Route a viewport click at (X,Y) — the raster is the full page, scroll-y stays 0,
-   so image coords are page coords.  mouse-release follows links + fires DOM click."
-  (when *page*
-    (l:mouse-press *page* x y)
-    (l:mouse-release *page* x y)   ; may replace *page* via on-navigate
-    (incf *gen*)))
+(defun click-tab (tab x y)
+  "Route a viewport click at (X,Y) in TAB — the raster is the full page, scroll-y
+   stays 0, so image coords are page coords.  mouse-release follows links (via the
+   page's on-navigate, which re-navigates this tab) + fires the DOM click."
+  (let ((pg (tab-page tab)))
+    (when pg
+      (l:mouse-press pg x y)
+      (l:mouse-release pg x y)   ; may re-navigate the tab via on-navigate
+      (incf (tab-gen tab)))))
 
 ;;; ---- the client -----------------------------------------------------------
 (defun client-html ()
@@ -167,11 +185,16 @@ body.showins #ip{display:block}
 <div id=ip></div>
 <script>
 var v=document.getElementById('v'),u=document.getElementById('u'),s=document.getElementById('s');
-var serverUrl='~a';                 // the URL the server currently has rendered
-u.value=serverUrl; s.textContent='~a';
+// A per-browser-tab id (sessionStorage is per tab), so each tab is its own server
+// session/context; every request carries it.  Cleared cookies can't merge tabs.
+var TAB=sessionStorage.getItem('loomtab')||(Date.now().toString(36)+Math.random().toString(36).slice(2,8));
+sessionStorage.setItem('loomtab',TAB);
+function T(u){return u+(u.indexOf('?')<0?'?':'&')+'tab='+encodeURIComponent(TAB);}
+var serverUrl='';                   // the URL this tab currently has rendered
+u.value=serverUrl; s.textContent='';
 var ti=0,t0=0,pend=null,phase='loading';   // timer handle, load start (ms), status to show once the image lands, current phase
 function hurl(){return decodeURIComponent(location.hash.slice(1));}
-function reimg(){v.src='/view.png?g='+Date.now();}
+function reimg(){v.src=T('/view.png?g='+Date.now());}
 // A navigation streams phase lines (fetching, parsing, rendering, …) then a final
 // line (SOH url US status).  Show each phase live with an elapsed counter, and hold
 // the busy state from the tap until the freshly-encoded image actually loads.
@@ -194,7 +217,7 @@ function onLine(ln){
 }
 function stream(endpoint,p){
   startLoad(p);
-  fetch(endpoint).then(function(r){
+  fetch(T(endpoint)).then(function(r){
     if(!r.body||!r.body.getReader){return r.text().then(function(t){t.split('\\n').forEach(onLine);});}
     var rd=r.body.getReader(),dec=new TextDecoder(),buf='';
     return (function pump(){return rd.read().then(function(res){
@@ -207,7 +230,7 @@ function stream(endpoint,p){
 function render(){var h=hurl();if(!h)return;u.value=h;if(h===serverUrl){reimg();return;}stream('/go?url='+encodeURIComponent(h),'connecting');}
 window.addEventListener('hashchange',render);
 document.getElementById('bar').onsubmit=function(e){e.preventDefault();var t=u.value.trim();if(!t)return;var enc=encodeURIComponent(t);if(location.hash.slice(1)===enc)render();else location.hash=enc;};
-document.getElementById('flag').onclick=function(){fetch('/flag').then(function(r){return r.text();}).then(function(t){s.textContent=t;}).catch(function(){s.textContent='network error';});};
+document.getElementById('flag').onclick=function(){fetch(T('/flag')).then(function(r){return r.text();}).then(function(t){s.textContent=t;}).catch(function(){s.textContent='network error';});};
 v.onclick=function(e){
   if(document.body.classList.contains('loading'))return;   // busy — ignore taps rather than queue them
   var r=v.getBoundingClientRect();
@@ -235,13 +258,16 @@ function renderInspector(d){
     h+='<div class=row><span class=lbl>'+esc(shorten(n.url))+'</span><span class=track>'+ibar(c,100*n.start/total,100*dur/total)+'</span><span class=ms>'+dur+'ms · '+sz(n.bytes)+'</span></div>';});
   document.getElementById('ip').innerHTML=h;
 }
-function refreshInspector(){if(document.body.classList.contains('showins'))fetch('/inspect.json').then(function(r){return r.json();}).then(renderInspector).catch(function(){});}
+function refreshInspector(){if(document.body.classList.contains('showins'))fetch(T('/inspect.json')).then(function(r){return r.json();}).then(renderInspector).catch(function(){});}
 document.getElementById('insp').onclick=function(){if(document.body.classList.toggle('showins'))refreshInspector();};
 document.getElementById('ip').onclick=function(e){if(e.target.className=='close')document.body.classList.remove('showins');};
-if(hurl())render(); else if(serverUrl){pend=s.textContent;startLoad('loading');reimg();location.hash=encodeURIComponent(serverUrl);}
-</script></body></html>"
-            (%jsesc (or (and *page* (l:page-url *page*)) ""))
-            (%jsesc *status*)))
+// Restore THIS tab's current page (a reload keeps the same server session/context)
+// without re-navigating — set serverUrl first so the hashchange just re-images.
+function restore(){fetch(T('/go')).then(function(r){return r.text();}).then(function(t){
+  var p=t.split('\\n');if(p[0]){serverUrl=p[0];u.value=p[0];s.textContent=p[1]||'';
+    var enc=encodeURIComponent(p[0]);if(location.hash.slice(1)!==enc)location.hash=enc;else reimg();}}).catch(function(){});}
+if(hurl())render(); else restore();
+</script></body></html>"))
 
 (defun %jsesc (s)
   "Escape S for a single-quoted JavaScript string literal."
@@ -347,16 +373,12 @@ Returns (values out encoding-or-nil)."
   (let ((base (or (cdr (assoc phase +phase-labels+)) (string-downcase (symbol-name phase)))))
     (if (and detail (plusp (length detail))) (format nil "~a ~a" base detail) base)))
 
-(defun state-final-line ()
+(defun state-final-line (tab)
   "The terminal streamed message: SOH, the page URL, US, single-line status."
   (format nil "~c~a~c~a" (code-char 1)
-          (or (and *page* (l:page-url *page*)) "")
+          (or (and (tab-page tab) (l:page-url (tab-page tab))) "")
           (code-char 31)
-          (substitute #\Space #\Newline (or *status* ""))))
-
-(defvar *timeline* nil
-  "The last navigation's phase marks: a list of (LABEL . ELAPSED-MS).  Paired with
-   L:*NET-LOG* it drives the inspector's performance + network waterfalls.")
+          (substitute #\Space #\Newline (or (tab-status tab) ""))))
 
 (defun %json-str (s)
   "S as a JSON string literal."
@@ -372,9 +394,9 @@ Returns (values out encoding-or-nil)."
         (t (if (< (char-code c) 32) (format o "\\u~4,'0x" (char-code c)) (write-char c o)))))
     (write-char #\" o)))
 
-(defun inspect-json ()
+(defun inspect-json (tab)
   "The last navigation's timeline, network log and page metrics as JSON."
-  (let* ((pg *page*) (doc (and pg (l:page-doc pg))))
+  (let* ((pg (tab-page tab)) (doc (and pg (l:page-doc pg))))
     (multiple-value-bind (els txt) (if doc (l:dom-node-counts doc) (values 0 0))
       (with-output-to-string (o)
         (flet ((kv (k v) (format o "~a:~a," (%json-str k) v)))
@@ -389,7 +411,7 @@ Returns (values out encoding-or-nil)."
           (kv "images" (if doc (length (weft.css:query-select-all doc "img")) 0))
           (kv "links" (if doc (length (weft.css:query-select-all doc "a")) 0))
           (format o "~a:[" (%json-str "phases"))
-          (loop for (phase . ms) in *timeline* for i from 0
+          (loop for (phase . ms) in (tab-timeline tab) for i from 0
                 do (when (plusp i) (write-char #\, o))
                    (format o "{~a:~a,~a:~d}"
                            (%json-str "label") (%json-str (phase-label phase nil))
@@ -422,9 +444,9 @@ Returns (values out encoding-or-nil)."
                                (%json-str "count") cnt (%json-str "bytes") kb (%json-str "ms") ms)))
             (format o "}}")))))))
 
-(defun run-streamed (stream thunk)
+(defun run-streamed (stream tab thunk)
   "Stream THUNK's progress: emit each phase, force the PNG encode (so the follow-up
-   /view.png is instant), then the final state line.  Also captures the phase
+   /view.png is instant), then TAB's final state line.  Also captures the phase
    timeline and per-fetch network log for the inspector."
   (send-stream-headers stream "text/plain; charset=utf-8")
   (l:net-log-reset)
@@ -443,10 +465,10 @@ Returns (values out encoding-or-nil)."
          (l:*progress* emit))
     (ignore-errors (funcall thunk))
     (funcall emit :encoding nil)
-    (ignore-errors (page-png-bytes))
+    (ignore-errors (tab-png-bytes tab))
     (push (cons :done (l:nav-elapsed-ms)) marks)
-    (setf *timeline* (nreverse marks)))
-  (ignore-errors (stream-line stream (state-final-line))))
+    (setf (tab-timeline tab) (nreverse marks)))
+  (ignore-errors (stream-line stream (state-final-line tab))))
 
 (defun header-value (head name)
   "Value of the NAME header (case-insensitive) in the raw request HEAD, or \"\"."
@@ -459,19 +481,20 @@ Returns (values out encoding-or-nil)."
           (string-trim " " (subseq head start end)))
         "")))
 
-(defun apply-viewport-width (head)
-  "Render at the requesting client's own viewport width (its `vw` cookie), defaulting to
-   1024 when the cookie is absent so a cookieless request never inherits a prior
-   visitor's width.  Relays out the shared page when the width changes."
+(defun apply-tab-width (tab head)
+  "Render TAB at the requesting client's own viewport width (its `vw` cookie),
+   defaulting to 1024 when absent.  Relays out this tab's page when the width
+   changes (mutating it, hence under *RENDER-LOCK*)."
   (let* ((cookie (header-value head "cookie"))
          (p (search "vw=" cookie))
          (vw (and p (ignore-errors (parse-integer cookie :start (+ p 3) :junk-allowed t))))
          (desired (if (and vw (<= 280 vw 2400)) vw 1024)))
-    (when (/= desired *render-width*)
-      (sb-thread:with-mutex (*render-lock*)     ; mutates *PAGE*: serialize with renders
-        (when (/= desired *render-width*)       ; re-check under the lock
-          (setf *render-width* desired)
-          (when *page* (ignore-errors (l:relayout *page* *render-width*) (incf *gen*))))))))
+    (when (/= desired (tab-width tab))
+      (sb-thread:with-mutex (*render-lock*)
+        (when (/= desired (tab-width tab))
+          (setf (tab-width tab) desired)
+          (when (tab-page tab)
+            (ignore-errors (l:relayout (tab-page tab) (tab-width tab)) (incf (tab-gen tab)))))))))
 
 (defun handle (stream)
   (let* ((head (read-head stream))
@@ -481,38 +504,40 @@ Returns (values out encoding-or-nil)."
          (target (or (second parts) "/"))
          (qpos (position #\? target))
          (path (if qpos (subseq target 0 qpos) target))
-         (query (and qpos (subseq target (1+ qpos)))))
-    (apply-viewport-width head)
+         (query (and qpos (subseq target (1+ qpos))))
+         ;; the client mints a tab id per browser tab (sessionStorage); each tab has
+         ;; its own page, status and browsing context.  "0" = a client without one.
+         (tab (tab-for (query-param query "tab"))))
+    (apply-tab-width tab head)
     (cond
       ((string= path "/view.png")
-       (let ((png (page-png-bytes)))
+       (let ((png (tab-png-bytes tab)))
          (if png (send stream "200 OK" "image/png" png)
              (send stream "404 Not Found" "text/plain" "no page"))))
       ((string= path "/go")
-       ;; stream navigation progress (fetching, parsing, rendering, …) then the final
-       ;; page state; the client reflects url/status and history lives in the hash.
+       ;; A typed/address-bar URL opens a FRESH browsing context (:fresh t) — distinct
+       ;; cookies, so this visit isn't tied to an earlier one.  Stream progress, then
+       ;; the final state; the client reflects url/status and history lives in the hash.
        (let ((url (query-param query "url")))
          (if (and url (plusp (length url)))
-             (sb-thread:with-mutex (*render-lock*)   ; one render at a time
-               (run-streamed stream (lambda () (navigate url))))
-             (send stream "200 OK" "text/plain; charset=utf-8" (state-text)))))
+             (sb-thread:with-mutex (*render-lock*)   ; one render at a time (shared caches)
+               (run-streamed stream tab (lambda () (navigate-tab tab url :fresh t))))
+             (send stream "200 OK" "text/plain; charset=utf-8" (tab-state-text tab)))))
       ((string= path "/inspect.json")
-       ;; the last navigation's performance timeline, network log and page metrics
-       (send stream "200 OK" "application/json; charset=utf-8" (inspect-json)))
+       (send stream "200 OK" "application/json; charset=utf-8" (inspect-json tab)))
       ((string= path "/click")
-       ;; a click may follow a link (page-url changes) — stream its progress like /go
+       ;; a click may follow a link — the page's on-navigate re-navigates THIS tab in
+       ;; the SAME context (:fresh nil), so a login/session carries across the click.
        (let ((x (ignore-errors (parse-integer (or (query-param query "x") "0"))))
              (y (ignore-errors (parse-integer (or (query-param query "y") "0")))))
-         (sb-thread:with-mutex (*render-lock*)       ; one render at a time
-           (run-streamed stream (lambda () (when (and x y) (handle-click x y)))))))
+         (sb-thread:with-mutex (*render-lock*)
+           (run-streamed stream tab (lambda () (when (and x y) (click-tab tab x y)))))))
       ((string= path "/flag")
-       ;; record the currently-shown page for later diagnosis — catches renders that are
-       ;; wrong but didn't error (unstyled, missing images), which nothing else logs.
-       (let ((u (or (and *page* (l:page-url *page*)) (query-param query "url"))))
+       (let ((u (or (and (tab-page tab) (l:page-url (tab-page tab))) (query-param query "url"))))
          (when (and u (plusp (length u)))
-           (log-error "flag" u (format nil "flagged; ~a" *status*))
-           (setf *status* (format nil "flagged for review: ~a" u))))
-       (send stream "200 OK" "text/plain; charset=utf-8" (or *status* "")))
+           (log-error "flag" u (format nil "flagged; ~a" (tab-status tab)))
+           (setf (tab-status tab) (format nil "flagged for review: ~a" u))))
+       (send stream "200 OK" "text/plain; charset=utf-8" (or (tab-status tab) "")))
       ((string= path "/")
        (send stream "200 OK" "text/html; charset=utf-8" (client-html)))
       (t (send stream "404 Not Found" "text/plain" "not found")))))
