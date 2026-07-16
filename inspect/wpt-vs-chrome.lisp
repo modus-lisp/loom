@@ -172,14 +172,17 @@ tests, not references), which is a clean layout-bearing corpus."
   (sb-ext:run-program "/bin/mkdir" (list "-p" path) :wait t))
 
 (defun main ()
-  (let ((tests (test-files)))
+  (let ((tests (test-files))
+        (skip-chrome (uiop:getenv "SKIP_CHROME")))   ; reuse cached Chrome TSVs (before/after weft runs)
     (unless tests (format t "~&no tests under ~a~%" *category*) (return-from main))
-    (ensure-dir *work*)
+    (unless skip-chrome (ensure-dir *work*))
     (let ((uf (format nil "~a/urls.txt" *work*)))
-      (with-open-file (s uf :direction :output :if-exists :supersede :if-does-not-exist :create)
-        (dolist (tp tests) (format s "file://~a~%" tp)))
-      (format t "~&Chrome-referenced structural audit: ~a tests under ~a @ ~apx~%" (length tests) *category* *width*)
-      (run-chrome uf *work* (length tests))
+      (unless skip-chrome
+        (with-open-file (s uf :direction :output :if-exists :supersede :if-does-not-exist :create)
+          (dolist (tp tests) (format s "file://~a~%" tp))))
+      (format t "~&Chrome-referenced structural audit: ~a tests under ~a @ ~apx~a~%"
+              (length tests) *category* *width* (if skip-chrome " (cached Chrome)" ""))
+      (unless skip-chrome (run-chrome uf *work* (length tests)))
       (let ((npass 0) (ngraded 0) (nfail 0) (nnoref 0) (rows '()))
         (loop for tp in tests for i from 0 do
           (let ((wg (weft-geom tp)) (cp (format nil "~a/~a.chrome.tsv" *work* i)))
