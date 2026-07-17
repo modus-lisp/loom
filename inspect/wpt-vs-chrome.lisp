@@ -15,8 +15,12 @@
 ;;;;        <wpt-root> <category> [limit] [width]
 ;;;;   e.g.  … /home/claude/wpt css/css-sizing 200
 (require :asdf)
+;; --script skips init files, so register the sibling projects + quicklisp
+;; (for chipz / codecs) explicitly rather than relying on asdf's registry cache.
+(let ((ql "/home/claude/quicklisp/setup.lisp")) (when (probe-file ql) (load ql)))
 (defparameter *loom-dir* (truename "/home/claude/loom/"))
 (push *loom-dir* asdf:*central-registry*)
+(push (truename "/home/claude/weft/") asdf:*central-registry*)
 (handler-bind ((warning #'muffle-warning)) (asdf:load-system "loom"))
 
 (defpackage #:wpt-cmp (:use #:cl))
@@ -159,6 +163,12 @@ tests, not references), which is a clean layout-bearing corpus."
                            (search "rel=\"mismatch" head) (search "rel='match" head)))
               (push (namestring p) out))))))
     (let ((tests (sort out #'string<)))
+      ;; SHUFFLE=1 makes a limited run an UNBIASED sample (deterministic seed) instead
+      ;; of the alphabetical-first slice, which tends to hit a category's hard subdir.
+      (when (and *limit* (uiop:getenv "SHUFFLE"))
+        (let ((rs (sb-ext:seed-random-state 20240607)) (v (coerce tests 'vector)))
+          (loop for i from (1- (length v)) downto 1 do (rotatef (aref v i) (aref v (random (1+ i) rs))))
+          (setf tests (coerce v 'list))))
       (if *limit* (subseq tests 0 (min *limit* (length tests))) tests))))
 
 ;;; ---- run ------------------------------------------------------------------
@@ -200,8 +210,8 @@ tests, not references), which is a clean layout-bearing corpus."
           (format t "~&~%=== ~a ===~%" *category*)
           (format t "  structural match vs Chrome: ~a/~a  (~,1f%)   render-fail ~a   no-chrome-ref ~a~%"
                   npass total (if (plusp total) (* 100.0 (/ npass total)) 0.0) nfail nnoref)
-          (format t "  worst structural divergences:~%")
-          (loop for (score tp status) in rows for k from 1 while (<= k 20) do
+          (format t "  failing tests (structural divergence >= ~a):~%" *pass-threshold*)
+          (loop for (score tp status) in rows while (>= score *pass-threshold*) do
             (format t "    ~7,1f  ~7a  ~a~%" score status
                     (let ((r (namestring *wpt-root*))) (if (and (> (length tp) (length r)))
                                                            (subseq tp (length r)) tp)))))))))
