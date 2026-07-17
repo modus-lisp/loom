@@ -17,7 +17,8 @@
 (defpackage #:loom.glass
   (:use #:cl)
   (:local-nicknames (#:r #:weft.render))
-  (:export #:serve #:run-glass #:glass-app #:glass-app-page #:glass-app-fb))
+  (:export #:serve #:run-glass #:attach #:pump-loop #:on-key #:on-pointer
+           #:glass-app #:glass-app-page #:glass-app-fb))
 (in-package #:loom.glass)
 
 (defstruct glass-app
@@ -142,6 +143,18 @@
                (setf (glass-app-dirty app) nil)))
            (incf i)
            (unless max-iterations (sleep 1/60))))
+
+(defun attach (page fb)
+  "Build an app driving PAGE into the EXISTING framebuffer FB (viewport = FB
+   size), wire link navigation, paint once, and return the app — WITHOUT owning a
+   server.  For embedding a live page as someone else's surface (e.g. a window in
+   a compositor / window manager): the host forwards RFB input to ON-KEY /
+   ON-POINTER and runs PUMP-LOOP to advance timers and repaint into FB."
+  (let ((app (make-glass-app :page page :fb fb
+                             :vw (glass:fb-width fb) :vh (glass:fb-height fb))))
+    (wire-navigation app)
+    (sb-thread:with-mutex ((glass-app-lock app)) (paint app))
+    app))
 
 (defun latin1 (string)
   "RFB desktop names are a byte string; fold any char > 255 (e.g. a title's
