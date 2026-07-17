@@ -3,3 +3,4 @@
 *.lx64fsl
 inspect/smoke.png
 .DS_Store
+loom-errors.db

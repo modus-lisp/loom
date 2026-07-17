@@ -113,6 +113,31 @@ sbcl --eval '(ql:quickload :loom/test)' --eval '(uiop:quit (if (loom.test:run) 0
 SDL_VIDEODRIVER=dummy sbcl --script inspect/smoke.lisp
 ```
 
+## A second backend: glass (VNC, no SDL, no X)
+
+The page model (`page.lisp`) is display-agnostic — `shell.lisp` is just the SDL
+driver over it. The optional **`loom/glass`** system is a *second* driver that
+serves the same page model over VNC through
+[**glass**](https://github.com/modus-lisp/glass), a pure-Common-Lisp framebuffer
++ RFB server. weft paints to a row-major RGB8 canvas; glass ships `0x00RRGGBB`
+framebuffers; the glass shell packs one into the other and turns RFB pointer/key
+events into the very same `mouse-press` / `mouse-wheel` / `key-down` page-model
+calls. **This backend has no FFI at all** — with it, the whole weaving stack
+(scribe / shuttle / gesso / stencil / weft / loom) is FFI-free end to end; point
+any VNC client at it.
+
+```lisp
+(ql:quickload :loom/glass)
+(loom.glass:run-glass :start "https://example.com" :port 5900)   ; then open a VNC viewer on :5900
+;; :background t returns immediately (server + pump run in threads)
+```
+
+`inspect/glass-demo.lisp` closes the loop headlessly: it serves the bundled home
+page over VNC, sends a real RFB click on a link, and confirms the page navigates
+and re-renders — all with an in-process RFB client, no display required. (weft's
+JS context is single-threaded, so the glass shell serialises the RFB client
+thread against the timer/repaint pump with one mutex.)
+
 ## Status / not yet
 
 - Editable text, form controls, focus and a text caret are a later round —

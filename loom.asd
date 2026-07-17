@@ -25,6 +25,16 @@
                              (:file "main"))))    ; run entrypoint + CLI
   :in-order-to ((test-op (test-op "loom/test"))))
 
+;;; A second, additive backend: drive the SAME page model over VNC via glass
+;;; (pure-CL framebuffer + RFB), with no SDL and no X.  Optional — load it only
+;;; when you want the glass display path; :loom (the SDL shell) is unchanged.
+(defsystem "loom/glass"
+  :description "A glass backend for loom: serve weft over VNC (pure-CL framebuffer
+                + RFB input) with no SDL/X — the FFI-free display path."
+  :version "0.0.1" :author "ynniv" :license "MIT"
+  :depends-on ("loom" "glass")
+  :components ((:module "src" :components ((:file "glass-shell")))))
+
 (defsystem "loom/test"
   :description "Headless tests for loom: the pure logic (hit-testing, SDL->DOM
                 translation, scroll math, URL resolution) and the page model
