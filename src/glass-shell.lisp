@@ -17,7 +17,7 @@
 (defpackage #:loom.glass
   (:use #:cl)
   (:local-nicknames (#:r #:weft.render))
-  (:export #:serve #:run-glass #:attach #:pump-loop #:on-key #:on-pointer
+  (:export #:serve #:run-glass #:attach #:pump-loop #:on-key #:on-pointer #:stop
            #:glass-app #:glass-app-page #:glass-app-fb))
 (in-package #:loom.glass)
 
@@ -26,7 +26,13 @@
   (vw 0) (vh 0)
   (lock (sb-thread:make-mutex :name "loom-glass-page"))
   (dirty t)
+  (running t)                           ; pump-loop keeps going while true
   (buttons 0))                          ; last RFB button mask (low 3 bits)
+
+(defun stop (app)
+  "Stop APP's pump loop (e.g. when its host window is closed) so weft stops
+   re-rendering into an orphaned framebuffer."
+  (setf (glass-app-running app) nil))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Paint — weft's RGB8 canvas slice -> the glass framebuffer
@@ -135,7 +141,7 @@
    the view; glass's dirty-tile diff ships only what actually changed.  Runs until
    MAX-ITERATIONS frames (headless) or forever (a live session)."
   (loop with i = 0
-        while (or (null max-iterations) (< i max-iterations))
+        while (and (glass-app-running app) (or (null max-iterations) (< i max-iterations)))
         do (sb-thread:with-mutex ((glass-app-lock app))
              (when (loom::pump (glass-app-page app)) (setf (glass-app-dirty app) t))
              (when (glass-app-dirty app)
