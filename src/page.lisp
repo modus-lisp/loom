@@ -1,4 +1,4 @@
-;;;; src/page.lisp — the persistent page model (no SDL).
+;;;; src/page.lisp — the persistent page model.
 ;;;;
 ;;;; A PAGE holds one live weft document across frames: the parsed DOM, its
 ;;;; scripting context (so setTimeout state, event listeners and DOM mutations
@@ -6,7 +6,7 @@
 ;;;; viewport scroll position.  The browsing loop is: load -> render -> translate
 ;;;; input into DOM events (weft dispatches them) -> pump timers -> re-render if
 ;;;; the DOM changed.  Every function here is pure Lisp and headlessly testable;
-;;;; the SDL shell (shell.lisp) is a thin driver over this model.
+;;;; the glass driver (glass-shell.lisp) is a thin driver over this model.
 (in-package #:loom)
 
 (defstruct page
@@ -678,7 +678,7 @@ Returns T when a config was found and applied."
 ;;; Input -> DOM events
 ;;; ---------------------------------------------------------------------------
 (defun mouse-press (pg vx vy &optional (button 0))
-  "Route an SDL mouse-button-down at viewport (VX,VY) to a trusted mousedown on
+  "Route a mouse-button-down at viewport (VX,VY) to a trusted mousedown on
    the hit node.  Returns the hit node."
   (let ((n (node-at-page pg vx vy)))
     (setf (page-press-node pg) n)
@@ -689,7 +689,7 @@ Returns T when a config was found and applied."
     n))
 
 (defun mouse-release (pg vx vy &optional (button 0))
-  "Route an SDL mouse-button-up at viewport (VX,VY): fire mouseup, and — if the
+  "Route a mouse-button-up at viewport (VX,VY): fire mouseup, and — if the
    pointer is still over the node that received the press — a click.  If the
    click's default action is not prevented and the node is (inside) a link, ask
    the shell to navigate.  Returns the hit node."
@@ -734,7 +734,7 @@ Returns T when a config was found and applied."
              (or (and cs (css:cstyle-cursor cs)) "default")))))
 
 (defun mouse-wheel (pg wheel-y)
-  "Scroll the viewport by an SDL wheel notch (WHEEL-Y).  Returns the new
+  "Scroll the viewport by a wheel notch (WHEEL-Y).  Returns the new
    scroll-y.  Pure viewport math — no relayout."
   (setf (page-scroll-y pg)
         (clamp-scroll (+ (page-scroll-y pg) (wheel->scroll-delta wheel-y))

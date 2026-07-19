@@ -1,49 +1,46 @@
-;;;; inspect/smoke.lisp — headless SDL smoke test (SDL_VIDEODRIVER=dummy).
+;;;; inspect/smoke.lisp — headless glass smoke test.
 ;;;;
-;;;; Proves the shell's FFI path end to end without a display: initialize SDL,
-;;;; create the window + renderer + streaming texture, load a real weft render,
-;;;; upload it into the texture (the zero-copy blit), and run several event-loop
-;;;; iterations without crashing.  Also writes the blitted canvas to a PNG so the
-;;;; render that feeds the texture can be eyeballed.
+;;;; Proves loom's glass display path end to end without a VNC client: load a
+;;;; real weft render into the page model, attach it to a glass framebuffer,
+;;;; pump the loop several frames (paint into the framebuffer + advance timers),
+;;;; and write the page canvas to a PNG so the render can be eyeballed.
 ;;;;
-;;;;   SDL_VIDEODRIVER=dummy sbcl --script inspect/smoke.lisp
+;;;;   sbcl --script inspect/smoke.lisp
 (require "asdf")
-;; --script skips ~/.sbclrc, so bootstrap quicklisp explicitly for the cffi dep.
+;; --script skips ~/.sbclrc, so bootstrap quicklisp explicitly for the deps.
 (let ((ql (merge-pathnames "quicklisp/setup.lisp" (user-homedir-pathname))))
   (when (probe-file ql) (load ql)))
 (push (truename (merge-pathnames "../" (directory-namestring *load-truename*)))
       asdf:*central-registry*)
-(funcall (read-from-string "ql:quickload") :loom :silent t)
+(funcall (read-from-string "ql:quickload") :loom/glass :silent t)
 
-(in-package #:loom)
+(in-package #:loom.glass)
 
 (defun smoke (&key (out "/home/claude/loom/inspect/smoke.png"))
-  (sdl:init)
-  (unwind-protect
-   (progn
-    (format t "~&SDL initialized (driver: ~a)~%"
-            (or (uiop:getenv "SDL_VIDEODRIVER") "default"))
-    (let* ((home (namestring (default-home)))
-           (page (load-file home :width 1024 :viewport-height 768)))
-      (format t "loaded ~a: canvas ~dx~d, title ~s~%"
-              home (r:canvas-width (page-canvas page)) (r:canvas-height (page-canvas page))
-              (page-title page))
-      ;; write the exact pixels that get blitted, as proof of the render/blit source
-      (r:write-png (page-canvas page) out)
-      (format t "wrote blit source PNG -> ~a~%" out)
-      ;; exercise the input translation through the page model (as the loop does)
-      (mouse-move page 40 60)
-      (mouse-wheel page -6)             ; scroll down a few notches
-      (format t "input applied: scroll-y ~d, cursor ~a~%"
-              (page-scroll-y page) (page-cursor page))
-      ;; run the real shell loop, bounded, under the dummy driver: it creates the
-      ;; window + renderer + streaming texture and blits the (scrolled) frame N
-      ;; times, then tears the window down — all through the SDL FFI path.
-      (let ((app (run-shell page :width 1024 :height 768 :max-iterations 8)))
-        (format t "shell ran: texture ~dx~d, 8 iterations, final scroll-y ~d~%"
-                (app-tex-w app) (app-tex-h app) (page-scroll-y (app-page app))))
-      (format t "SMOKE-OK~%")))
-   (sdl:quit)))
+  (let* ((home (namestring (loom::default-home)))
+         (page (loom:load-file home :width 1024 :viewport-height 768)))
+    (loom:render-page page)
+    (format t "~&loaded ~a: canvas ~dx~d, title ~s~%"
+            home (weft.render:canvas-width (loom:page-canvas page))
+            (weft.render:canvas-height (loom:page-canvas page))
+            (loom:page-title page))
+    ;; write the exact pixels glass packs into the framebuffer, as proof of source
+    (weft.render:write-png (loom:page-canvas page) out)
+    (format t "wrote render PNG -> ~a~%" out)
+    ;; exercise the input translation through the page model (as the RFB callbacks do)
+    (loom:mouse-move page 40 60)
+    (loom:mouse-wheel page -6)           ; scroll down a few notches
+    (format t "input applied: scroll-y ~d, cursor ~a~%"
+            (loom:page-scroll-y page) (loom:page-cursor page))
+    ;; attach the page to a glass framebuffer and pump the loop headlessly: this
+    ;; paints the (scrolled) frame into the framebuffer and advances timers N
+    ;; times — the whole glass display path, minus the RFB socket.
+    (let* ((fb (glass:make-framebuffer 1024 768 (glass:rgb 255 255 255)))
+           (app (attach page fb)))
+      (pump-loop app :max-iterations 8)
+      (format t "glass path ran: framebuffer ~dx~d, 8 iterations, final scroll-y ~d~%"
+              (glass:fb-width fb) (glass:fb-height fb) (loom:page-scroll-y page))
+      (format t "SMOKE-OK~%"))))
 
 (handler-case (smoke)
   (error (e) (format t "~&SMOKE-FAIL: ~a~%" e) (uiop:quit 1)))

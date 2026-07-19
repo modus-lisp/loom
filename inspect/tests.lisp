@@ -25,9 +25,9 @@
 ;;; ---- pure helpers ---------------------------------------------------------
 (defun test-pure ()
   (format t "~&-- pure input / scroll / url --~%")
-  (check "button left  -> 0" (loom:sdl-button->dom 1) 0)
-  (check "button middle-> 1" (loom:sdl-button->dom 2) 1)
-  (check "button right -> 2" (loom:sdl-button->dom 3) 2)
+  (check "button left  -> 0" (loom:pointer-button->dom 1) 0)
+  (check "button middle-> 1" (loom:pointer-button->dom 2) 1)
+  (check "button right -> 2" (loom:pointer-button->dom 3) 2)
   ;; wheel: +Y (scroll up) => negative (upward) pixel delta
   (check "wheel up  -> -step" (loom:wheel->scroll-delta 1 40) -40)
   (check "wheel down-> +step" (loom:wheel->scroll-delta -2 40) 80)
