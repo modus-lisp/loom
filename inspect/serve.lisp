@@ -6,10 +6,21 @@
 ;;;; follows the link, re-renders, and serves the new raster.  All the browsing
 ;;;; logic is loom's SDL-free page model; this file is just an HTTP front-end.
 ;;;;   sbcl --script inspect/serve.lisp [port]
+;; --script skips the init file, so load quicklisp explicitly: it sets up ASDF, the
+;; quicklisp dists (chipz + other weft deps) and local-projects (weft/loom/shuttle).
+(let ((ql (merge-pathnames "quicklisp/setup.lisp" (user-homedir-pathname))))
+  (when (probe-file ql) (load ql)))
 (require :asdf)
 (require :sb-bsd-sockets)
-(push (truename (merge-pathnames "../" (directory-namestring *load-truename*)))
-      asdf:*central-registry*)
+;; Register loom and its sibling engine projects (weft, shuttle) on the ASDF
+;; central registry.  --script skips the init file, so quicklisp's local-projects
+;; are not scanned; register the sibling dirs explicitly so loom's dependency on
+;; weft/render + shuttle resolves without quicklisp.
+(let ((loomdir (merge-pathnames "../" (directory-namestring *load-truename*))))
+  (dolist (d (list loomdir
+                   (merge-pathnames "../weft/" loomdir)
+                   (merge-pathnames "../shuttle/" loomdir)))
+    (when (probe-file d) (push (truename d) asdf:*central-registry*))))
 (handler-bind ((warning #'muffle-warning))
   (asdf:load-system "loom"))
 
