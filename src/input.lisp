@@ -5,18 +5,18 @@
 ;;;; They are unit-tested headlessly (inspect/tests.lisp).
 (in-package #:loom)
 
-(defun sdl-button->dom (sdl-button)
-  "Map an SDL mouse button number (1 left, 2 middle, 3 right) to the DOM
+(defun pointer-button->dom (button)
+  "Map a 1-based pointer button number (1 left, 2 middle, 3 right) to the DOM
    MouseEvent.button code (0 left, 1 middle, 2 right)."
-  (case sdl-button (1 0) (2 1) (3 2) (t 0)))
+  (case button (1 0) (2 1) (3 2) (t 0)))
 
 (defparameter *wheel-step* 48
   "Pixels of scroll per mouse-wheel notch.")
 
 (defun wheel->scroll-delta (wheel-y &optional (step *wheel-step*))
-  "Pixels to add to scroll-y for an SDL wheel event whose Y is WHEEL-Y.  SDL
-   reports +Y for scrolling up (away from the user); the page scrolls the
-   opposite way, so a positive wheel-y yields a negative (upward) delta."
+  "Pixels to add to scroll-y for a wheel notch whose Y is WHEEL-Y.  A +Y notch
+   means scrolling up (away from the user); the page scrolls the opposite way, so
+   a positive wheel-y yields a negative (upward) delta."
   (* (- wheel-y) step))
 
 (defun clamp-scroll (y content-height viewport-height)

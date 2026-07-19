@@ -1,10 +1,9 @@
-;;;; src/main.lisp — the run entrypoint and CLI.
+;;;; src/main.lisp — start-page and file-URL helpers.
 ;;;;
-;;;; RUN is the one call a user makes.  It initializes SDL and opens the window
-;;;; on the start page (a CLI URL/path, or the bundled home page).  macOS/Cocoa
-;;;; requires the window + event loop to run on the process main thread; RUN must
-;;;; therefore be called on the initial thread (the sbcl --eval / run.sh path,
-;;;; not a spawned thread or a SLIME worker) — see the README.
+;;;; loom drives weft through a display backend (glass, over VNC — see
+;;;; src/glass-shell.lisp).  These are the small backend-agnostic helpers a
+;;;; driver needs to open its first page: the bundled home page and the
+;;;; file:// -> path resolution a followed link uses.
 (in-package #:loom)
 
 (defun default-home ()
@@ -13,40 +12,6 @@
                             (asdf:system-source-directory "loom"))))
     (and (probe-file p) p)))
 
-(defun open-start-page (start &key (width 1024) (height 768))
-  "Load START (an http(s) URL, a local file path, or NIL -> the bundled home
-   page) into a fresh page."
-  (cond
-    ((null start)
-     (let ((home (default-home)))
-       (if home (load-file (namestring home) :width width :viewport-height height)
-           (load-page "<title>loom</title><body><h1>loom</h1><p>No start page.</p></body>"
-                      :width width :viewport-height height))))
-    ((or (url-prefix-p "http:" start) (url-prefix-p "https:" start))
-     (load-url start :width width :viewport-height height))
-    (t (load-file start :width width :viewport-height height))))
-
-(defun run (&key start (width 1024) (height 768))
-  "Open loom's window on START and browse.  Call this on the process main thread
-   (macOS/Cocoa requires it) — i.e. from the REPL's initial thread or an
-   sbcl --eval / run.sh invocation, not a spawned thread.
-
-     (loom:run)                         ; the bundled home page
-     (loom:run :start \"https://example.com\")
-     (loom:run :start \"/path/to/page.html\")"
-  ;; SBCL enables floating-point traps (:invalid :overflow :divide-by-zero) by
-  ;; default; SDL and the platform window layer (Cocoa/Metal retina scaling on
-  ;; macOS) do FP math that produces NaN/Inf, which would trap the process.  C
-  ;; graphics code expects those masked, so disable traps for the session — the
-  ;; render engine already tolerates degenerate values (it runs trap-free on Linux).
-  #+sbcl (sb-int:set-floating-point-modes :traps nil)
-  (sdl:init)
-  (unwind-protect
-       (run-shell (open-start-page start :width width :height height)
-                  :width width :height height)
-    (sdl:quit)))
-
-(defun main ()
-  "CLI entry: the first argv is an optional start URL/path."
-  (let ((args (uiop:command-line-arguments)))
-    (run :start (first args))))
+(defun url->path (file-url)
+  "The filesystem path of a file:// URL (or the string unchanged)."
+  (if (url-prefix-p "file://" file-url) (subseq file-url 7) file-url))

@@ -1,42 +1,38 @@
 ;;;; loom.asd — the interactive browser shell for weft.
 ;;;;
-;;;; loom is the platform shell: it opens a native window over SDL2, blits weft's
-;;;; painted canvas into it, and translates SDL input into the DOM events weft
-;;;; already dispatches.  This is the ONE place FFI lives — the engine stack
-;;;; (scribe/shuttle/gesso/stencil/weft) stays pure Common Lisp.
-;;;;
-;;;; SDL2 is bound with hand-written CFFI (src/sdl-ffi.lisp), NOT cl-sdl2: that
-;;;; library uses cl-autowrap, which shells out to c2ffi (an LLVM tool) at build
-;;;; time — hard to install, especially on macOS.  So loom depends only on cffi
-;;;; (pure Quicklisp) plus the SDL2 shared library (brew install sdl2).
+;;;; loom turns the weft web engine into a real, browsable session: it holds a
+;;;; persistent page model (load -> render -> dispatch DOM events -> re-render)
+;;;; and drives it through a display backend.  The core (this "loom" system) is
+;;;; display-agnostic and FFI-free pure Common Lisp; the backend that puts it on
+;;;; a screen is loom/glass — a glass framebuffer served over VNC (RFB input, no
+;;;; SDL and no X), keeping the whole stack (scribe/shuttle/gesso/stencil/weft)
+;;;; free of any C FFI.
 (defsystem "loom"
-  :description "An interactive browser shell that turns the weft web engine into a
-                real, browsable native window (SDL2 window + input -> weft render
-                + DOM events).  FFI lives here only; the engine stays pure CL."
+  :description "The display-agnostic browser core for weft: a persistent page
+                model with input translation and start-page helpers, driven by a
+                display backend (loom/glass).  Pure Common Lisp, no FFI."
   :version "0.0.1" :author "ynniv" :license "MIT"
-  :depends-on ("weft/render" "weft/script" "weft/fetch" "seal" "cffi")
+  :depends-on ("weft/render" "weft/script" "weft/fetch" "seal")
   :serial t
   :components ((:module "src" :serial t
                 :components ((:file "packages")
-                             (:file "sdl-ffi")   ; hand-written CFFI bindings to libSDL2 (the ONLY FFI)
-                             (:file "input")     ; pure SDL->DOM + scroll/url math
-                             (:file "page")      ; persistent page model (no SDL)
-                             (:file "shell")     ; SDL glue: window/renderer/texture/loop
-                             (:file "main"))))    ; run entrypoint + CLI
+                             (:file "input")     ; pure pointer/wheel -> DOM + scroll/url math
+                             (:file "page")      ; persistent page model
+                             (:file "main"))))    ; start-page + file-URL helpers
   :in-order-to ((test-op (test-op "loom/test"))))
 
-;;; A second, additive backend: drive the SAME page model over VNC via glass
-;;; (pure-CL framebuffer + RFB), with no SDL and no X.  Optional — load it only
-;;; when you want the glass display path; :loom (the SDL shell) is unchanged.
+;;; The display backend: drive the page model over VNC via glass (pure-CL
+;;; framebuffer + RFB), with no SDL and no X.  This is loom's everyday driver.
 (defsystem "loom/glass"
-  :description "A glass backend for loom: serve weft over VNC (pure-CL framebuffer
-                + RFB input) with no SDL/X — the FFI-free display path."
+  :description "loom's display backend: serve weft over VNC (pure-CL framebuffer
+                + RFB input) with no SDL/X — the FFI-free display path.  This is
+                the everyday-driver UI (loom.glass:run-glass)."
   :version "0.0.1" :author "ynniv" :license "MIT"
   :depends-on ("loom" "glass")
   :components ((:module "src" :components ((:file "glass-shell")))))
 
 (defsystem "loom/test"
-  :description "Headless tests for loom: the pure logic (hit-testing, SDL->DOM
+  :description "Headless tests for loom: the pure logic (hit-testing, pointer->DOM
                 translation, scroll math, URL resolution) and the page model
                 (load -> render -> dispatch a click -> observe the DOM react)."
   :depends-on ("loom")

@@ -1,19 +1,20 @@
 #!/bin/sh
-# run.sh — launch loom on a start URL/path (default: the bundled home page).
-#   ./run.sh                         # bundled home page
-#   ./run.sh https://example.com     # a URL
-#   ./run.sh path/to/page.html       # a local file
-# Requires: SDL2 (brew install sdl2) + a Lisp with Quicklisp + loom/weft on the
-# ASDF path (see README).  Cocoa needs the main thread; this sbcl --eval path runs
-# loom:run on the process main thread, which is exactly what's required.
+# run.sh — launch loom's glass UI (weft served over VNC) on a start URL/path.
+#   ./run.sh                              # bundled home page, VNC on :5900
+#   ./run.sh https://example.com          # a URL
+#   ./run.sh path/to/page.html            # a local file
+#   ./run.sh https://example.com 5901     # a URL on a chosen VNC port
+# Connect a VNC client to localhost:<port> (default 5900) to browse.  Requires a
+# Lisp with Quicklisp + loom/weft/glass on the ASDF path — no SDL, no X.
+PORT="${2:-5900}"
 if [ -n "$1" ]; then
   exec sbcl --control-stack-size 256 --dynamic-space-size 4096 \
-            --eval '(ql:quickload :loom)' \
-            --eval "(loom:run :start \"$1\")" \
+            --eval '(ql:quickload :loom/glass)' \
+            --eval "(loom.glass:run-glass :start \"$1\" :port $PORT)" \
             --eval '(uiop:quit 0)'
 else
   exec sbcl --control-stack-size 256 --dynamic-space-size 4096 \
-            --eval '(ql:quickload :loom)' \
-            --eval '(loom:run)' \
+            --eval '(ql:quickload :loom/glass)' \
+            --eval "(loom.glass:run-glass :port $PORT)" \
             --eval '(uiop:quit 0)'
 fi
