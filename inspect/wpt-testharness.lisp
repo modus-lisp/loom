@@ -29,6 +29,14 @@
 (push (truename "/home/claude/shuttle/") asdf:*central-registry*)
 (handler-bind ((warning #'muffle-warning)) (asdf:load-system "loom"))
 
+;; Conformance-measurement budget (this runner ONLY — not loom's production page
+;; budget). A few WPT testharness mega-files generate thousands of subtests
+;; (dom/ranges/Range-set alone emits 10920) whose harness needs more wall-clock
+;; than a raster load's 6 s *js-budget* allows; under the default they report
+;; NO-RESULT even though every subtest runs. Raise the script budget here so the
+;; harness completes and its real per-subtest pass count is measurable.
+(setf loom::*js-budget* 30.0)
+
 (defpackage #:wpt-th (:use #:cl))
 (in-package #:wpt-th)
 
@@ -37,7 +45,7 @@
 (defparameter *limit* (and (second *args*) (parse-integer (second *args*) :junk-allowed t)))
 (defparameter *wpt-root* (namestring (truename (or (third *args*) "/home/claude/wpt/"))))
 (defparameter *width* (or (and (fourth *args*) (parse-integer (fourth *args*) :junk-allowed t)) 800))
-(defparameter *timeout* 20)
+(defparameter *timeout* 45)   ; per-file wall-clock cap; must exceed *js-budget* above
 
 ;;; ---- file IO --------------------------------------------------------------
 (defun slurp-string (path)
