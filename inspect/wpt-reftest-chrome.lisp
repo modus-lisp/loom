@@ -234,7 +234,7 @@ or :error / :timeout."
 (defun png->canvas (bytes)
   "Decode PNG BYTES (Chrome screenshot) into an RGB canvas of the runner size,
 compositing straight-alpha over white.  NIL on decode failure."
-  (let ((img (ignore-errors (r::png-decode bytes))))
+  (let ((img (ignore-errors (pigment:png-decode bytes))))
     (when img
       (let* ((iw (r::img-w img)) (ih (r::img-h img)) (rgba (r::img-rgba img))
              (cv (r:make-canvas *width* *height* '(255 255 255)))
