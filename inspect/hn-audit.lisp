@@ -10,9 +10,18 @@
 ;;;;   sbcl --dynamic-space-size 4096 --script inspect/hn-audit.lisp
 ;;;; Env: HN_WIDTH (1024), HN_DB (../loom-errors.db), HN_LOG_TOP (15),
 ;;;;      HN_MIN_SCORE (8), HN_TIMEOUT (60), HN_WORK (/tmp/hn-audit).
+;; --script skips the init file, so load quicklisp explicitly (ASDF + the chipz
+;; dist) and register loom's sibling engine projects — loom's dependency graph
+;; (weft/pigment/cram/scribe/gesso/stencil/webp-pure/shuttle/seal/glass) is not
+;; on the source registry otherwise.
+(let ((ql (merge-pathnames "quicklisp/setup.lisp" (user-homedir-pathname))))
+  (when (probe-file ql) (load ql)))
 (require :asdf)
 (defparameter *loom-dir* (truename "/home/claude/loom/"))
-(push *loom-dir* asdf:*central-registry*)
+(let ((home (merge-pathnames "../" *loom-dir*)))
+  (dolist (d '("loom/" "weft/" "shuttle/" "pigment/" "cram/" "scribe/" "gesso/"
+               "stencil/" "webp-pure/" "seal/" "glass/" "brotli-pure/" "zstd-pure/"))
+    (let ((p (merge-pathnames d home))) (when (probe-file p) (push (truename p) asdf:*central-registry*)))))
 (handler-bind ((warning #'muffle-warning)) (asdf:load-system "loom"))
 
 (defpackage #:hn-audit (:use #:cl))
