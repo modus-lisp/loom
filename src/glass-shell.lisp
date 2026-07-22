@@ -27,7 +27,12 @@
   (lock (sb-thread:make-mutex :name "loom-glass-page"))
   (dirty t)
   (running t)                           ; pump-loop keeps going while true
-  (buttons 0))                          ; last RFB button mask (low 3 bits)
+  (buttons 0)                           ; last RFB button mask (low 3 bits)
+  ;; scroll-triggered lazy image loading (see MAYBE-WARM-LAZY):
+  (warmed (make-hash-table :test 'equal)) ; lazy img URLs already warm-attempted (no re-warm)
+  (warming nil)                         ; T while a background warm+re-render is in flight
+  (last-scroll -1)                      ; page-scroll-y at the last lazy check (skip if unmoved)
+  (last-lazy-check 0))                  ; internal-real-time of the last check (throttle to a few/sec)
 
 (defun stop (app)
   "Stop APP's pump loop (e.g. when its host window is closed) so weft stops
@@ -134,6 +139,58 @@
         (setf (glass-app-dirty app) t)))))
 
 ;;; ---------------------------------------------------------------------------
+;;; Scroll-triggered lazy image loading
+;;; ---------------------------------------------------------------------------
+;;; The glass driver scrolls by blitting a slice of the PRE-rendered full-page canvas
+;;; (PAINT), so it never re-lays-out — a below-fold loading=lazy <img> would show its
+;;; gray placeholder forever.  As the view scrolls, pull those images in like a real
+;;; browser: notice when new deferred lazy images enter the scroll-relative in-view band,
+;;; warm them (network) OFF the page lock so scrolling stays smooth, then re-render under
+;;; the lock and mark the frame dirty so they "pop in" on the next paint.
+(defparameter *lazy-check-interval* 1/5
+  "Minimum seconds between scroll-driven lazy-image checks — throttles the box-tree walk
+   to a few times a second so it never competes with the paint loop.")
+
+(defun maybe-warm-lazy (app)
+  "If scrolling has brought new deferred loading=lazy images into the in-view band, kick
+   a background warm + re-render (non-blocking) so they pop in on a later frame.  Debounced
+   three ways: skipped while a warm is already in flight, when the scroll hasn't moved since
+   the last check, and throttled to *LAZY-CHECK-INTERVAL*; each URL is warmed at most once
+   (a failed/offline image never re-triggers).  The slow network fetch runs off the page
+   lock; only the final re-render (canvas swap) takes the lock, so the paint loop is smooth."
+  (when (glass-app-warming app)
+    (return-from maybe-warm-lazy nil))
+  (let ((now (get-internal-real-time)))
+    (when (< (/ (- now (glass-app-last-lazy-check app)) internal-time-units-per-second)
+             *lazy-check-interval*)
+      (return-from maybe-warm-lazy nil))
+    (setf (glass-app-last-lazy-check app) now))
+  (let ((pg (glass-app-page app)) (new '()))
+    ;; read the pending in-view lazy set under the lock (it walks the live box tree)
+    (sb-thread:with-mutex ((glass-app-lock app))
+      (let ((sy (loom:page-scroll-y pg)))
+        (when (/= sy (glass-app-last-scroll app))
+          (setf (glass-app-last-scroll app) sy)
+          (dolist (u (loom:inview-lazy-pending-urls pg))
+            (unless (gethash u (glass-app-warmed app)) (push u new))))))
+    (when new
+      (dolist (u new) (setf (gethash u (glass-app-warmed app)) t))  ; don't re-warm these
+      (setf (glass-app-warming app) t)
+      (sb-thread:make-thread
+       (lambda ()
+         (unwind-protect
+             (handler-case
+                 (progn
+                   (loom:warm-image-urls pg new)              ; network — OFF the page lock
+                   (sb-thread:with-mutex ((glass-app-lock app))
+                     (loom:render-page pg)                    ; cache-hit fill + repaint, under lock
+                     (setf (glass-app-dirty app) t)))         ; next paint shows the pop-in
+               (error (e) (format *error-output* "~&loom.glass: lazy warm failed: ~a~%" e)))
+           (setf (glass-app-warming app) nil)))
+       :name "loom-glass-lazy")
+      t)))
+
+;;; ---------------------------------------------------------------------------
 ;;; The loop
 ;;; ---------------------------------------------------------------------------
 (defun pump-loop (app &key max-iterations)
@@ -147,6 +204,9 @@
              (when (glass-app-dirty app)
                (paint app)
                (setf (glass-app-dirty app) nil)))
+           ;; off the lock: notice new lazy images the scroll brought into view and
+           ;; warm+re-render them in the background (non-blocking — see MAYBE-WARM-LAZY).
+           (maybe-warm-lazy app)
            (incf i)
            (unless max-iterations (sleep 1/60))))
 

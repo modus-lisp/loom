@@ -633,6 +633,10 @@ Returns T when a config was found and applied."
             (r:*progress* #'report-progress)            ; :cascade / :layout / :painting
             (r:*image-fetch-deadline* deadline)
             (r:*fetch-inview-lazy* fetch-lazy)
+            ;; measure the in-view loading=lazy band from the live scroll offset, so a
+            ;; re-render after scrolling fills the images that entered view (not just the
+            ;; top-of-document set).  At the initial load scroll-y is 0 — the original band.
+            (r:*lazy-scroll-y* (float (page-scroll-y pg) 1.0))
             (fetch:*progress* nil) (seal:*progress* nil)) ; image/font fetches here aren't the document download
         ;; VIEWPORT-HEIGHT/SCROLL-TO only take effect when the page clips at the root
         ;; (a viewport-model page like Acid2); a normal page ignores them and its
@@ -666,8 +670,13 @@ Returns T when a config was found and applied."
     ;; Pass 1 — lazy images defer (learn their laid-out positions); eager cache
     ;; misses still fetch under the budget as before.
     (let* ((root (%render-once pg deadline nil))
-           (urls (and root (ignore-errors (r:inview-lazy-image-urls
-                                           root (page-viewport-height pg))))))
+           ;; collect the in-view lazy set from the SAME scroll-relative band the fill
+           ;; pass uses (bind *lazy-scroll-y* to the live scroll-y), so after scrolling
+           ;; the warm set matches the images the re-render will actually fill.
+           (urls (and root
+                      (let ((r:*lazy-scroll-y* (float (page-scroll-y pg) 1.0)))
+                        (ignore-errors (r:inview-lazy-image-urls
+                                        root (page-viewport-height pg)))))))
       (when urls
         ;; warm the in-view lazy set concurrently, then re-render to fill it (cache
         ;; hits — the fresh budget still lets any straggler fetch once, bounded).
@@ -677,6 +686,49 @@ Returns T when a config was found and applied."
          deadline)
         (%render-once pg deadline t))))
   pg)
+
+;;; ---- scroll-triggered lazy loading --------------------------------------
+;;; An interactive driver (loom.glass) scrolls by blitting a slice of the full-page
+;;; canvas, so it never re-lays-out — a below-fold loading=lazy <img> would show its
+;;; placeholder forever.  These let the driver pull those images in as they scroll into
+;;; view: read the deferred set now in the scroll-relative band, warm it off the render
+;;; lock (network), then re-render under the lock to fill it (cache hits).
+(defun inview-lazy-pending-urls (pg)
+  "The network src URLs of the deferred loading=lazy <img>s that PG's CURRENT scroll-y
+   brings into the in-view band but whose box is still empty (not yet loaded).  A cheap
+   box-tree walk — the driver polls it as the view scrolls to learn when there is new
+   lazy content to warm.  NIL when nothing new is in view."
+  (let ((root (page-root pg)))
+    (and root
+         (let ((r:*lazy-scroll-y* (float (page-scroll-y pg) 1.0)))
+           (ignore-errors (r:inview-lazy-image-urls root (page-viewport-height pg)))))))
+
+(defun warm-image-urls (pg urls)
+  "Fetch URLS (loading=lazy image URLs) concurrently into weft's persistent image cache,
+   OFF any render lock, so a following render finds them warm.  Bounded by the image
+   prefetch budget.  Safe to call from a background thread (each worker binds its own
+   loader/deadline/cookie-jar)."
+  (when urls
+    (let ((deadline (+ (get-internal-real-time)
+                       (round (* *image-prefetch-budget* internal-time-units-per-second)))))
+      (join-threads-until
+       (prefetch-image-urls urls (page-image-loader pg) deadline fetch:*cookie-jar*
+                            *lazy-warm-concurrency*)
+       deadline))))
+
+(defun warm-lazy-for-scroll (pg)
+  "Warm and paint any deferred loading=lazy images PG's current scroll-y has brought
+   into the in-view band but that aren't loaded yet, then re-render (relayout + repaint
+   into the page canvas, preserving JS state and scroll position).  Returns T when there
+   was new in-view lazy content (so it re-rendered — the caller should repaint), NIL when
+   the band held nothing new (no work, no re-render — cheap to call on every scroll tick).
+   Synchronous: warms on the calling thread.  A driver that must keep its paint loop
+   smooth splits this — WARM-IMAGE-URLS off the lock, then RENDER-PAGE under it."
+  (let ((urls (inview-lazy-pending-urls pg)))
+    (when urls
+      (warm-image-urls pg urls)
+      (render-page pg)
+      t)))
 
 (defun relayout (pg new-width &optional new-viewport-height)
   "Re-lay out PG at a new window width (and optionally viewport height) — the
