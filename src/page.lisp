@@ -380,6 +380,13 @@
    the cores and defeats keep-alive connection reuse, so a wide fan-out is slower
    than a handful of reusing workers.")
 
+(defparameter *lazy-warm-concurrency* 8
+  "Concurrency for warming the in-view loading=lazy set after layout.  Higher than
+   the general prefetch: this set is small, above-the-fold-important, and typically
+   one CDN host (so keep-alive is reused), and it runs on the critical path AFTER
+   layout (it can't overlap the JS phase), so a wider fan-out gets the visible
+   images in with the least added wall-clock.")
+
 (defparameter *font-load-budget* 5.0
   "Seconds a render may spend fetching @font-face web fonts before falling back for
    the rest (see WEFT.RENDER:*FONT-LOAD-BUDGET*).  Bounds a page that injects a huge
@@ -403,21 +410,14 @@
           (ignore-errors (sb-thread:join-thread th :timeout remaining :default nil))
           (return)))))            ; budget spent: leave the rest running
 
-(defun start-image-prefetch (doc image-loader deadline jar)
-  "Spawn concurrent fetches for every network <img>, keyed exactly as layout looks
-   them up (R:IMG-SOURCE-URL — the raw src/srcset value FETCH-IMAGE caches under),
-   and return the threads.  Meant to run ALONGSIDE the script phase so the bitmaps
-   are warm by the time layout needs their dimensions, off the critical path.
-   Each worker binds *IMAGE-LOADER*, the fetch DEADLINE, and this context's cookie
-   JAR itself (dynamic bindings don't cross threads) — so a tracking pixel's cookie
-   lands in this browsing context, not a shared jar; FETCH-IMAGE does the caching."
-  (let* ((urls (remove-duplicates
-                (loop for n in (css:query-select-all doc "img")
-                      for u = (r:img-source-url n)
-                      when (and u (not (and (>= (length u) 5) (string-equal (subseq u 0 5) "data:"))))
-                        collect u)
-                :test #'string=))
-         (sem (sb-thread:make-semaphore :count *image-prefetch-concurrency*)))
+(defun prefetch-image-urls (urls image-loader deadline jar
+                            &optional (concurrency *image-prefetch-concurrency*))
+  "Spawn bounded-CONCURRENCY fetches for the image URLS (keyed exactly as layout
+   looks them up, so FETCH-IMAGE's cache is warm when layout reads it) and return
+   the threads.  Each worker binds *IMAGE-LOADER*, the fetch DEADLINE and this
+   context's cookie JAR itself — dynamic bindings don't cross threads, so a
+   tracking pixel's cookie lands in THIS browsing context, not a shared jar."
+  (let ((sem (sb-thread:make-semaphore :count (max 1 concurrency))))
     (mapcar (lambda (u)
               (sb-thread:make-thread
                (lambda ()
@@ -429,6 +429,21 @@
                    (sb-thread:signal-semaphore sem)))
                :name "img-prefetch"))
             urls)))
+
+(defun start-image-prefetch (doc image-loader deadline jar)
+  "Warm every EAGER network <img> bitmap concurrently, alongside the script phase,
+   so they're cached before layout needs their dimensions — off the critical path.
+   loading=lazy images are skipped: they're deferred and only fetched (in view) by
+   the post-layout pass, so prefetching them would burn the shared image budget on
+   off-screen thumbnails and starve the above-fold/eager set (HTML §lazy-loading)."
+  (let ((urls (remove-duplicates
+               (loop for n in (css:query-select-all doc "img")
+                     for u = (r:img-source-url n)
+                     when (and u (not (r:img-loading-lazy-p n))
+                               (not (and (>= (length u) 5) (string-equal (subseq u 0 5) "data:"))))
+                       collect u)
+               :test #'string=)))
+    (prefetch-image-urls urls image-loader deadline jar)))
 
 (defun make-prefetching-loader (doc base fallback)
   "Fetch every external stylesheet/script in DOC concurrently up front, then serve them
@@ -606,15 +621,18 @@ Returns T when a config was found and applied."
 ;;; ---------------------------------------------------------------------------
 ;;; Rendering
 ;;; ---------------------------------------------------------------------------
-(defun render-page (pg)
-  "Re-cascade, lay out and paint PG's current document at its width (reader view:
-   the canvas grows to full content height; the shell blits a viewport slice).
-   Refreshes the canvas, box tree, styles and content height, and re-clamps the
-   scroll position."
+(defun %render-once (pg deadline fetch-lazy)
+  "One cascade + layout + paint pass of PG under image budget DEADLINE, storing the
+   canvas/box-tree/styles/content-height back on PG and re-clamping scroll.  When
+   FETCH-LAZY is NIL the post-layout lazy pass only defers (a probe layout to learn
+   in-view positions); T fills the in-view lazy set (from the warmed cache).  Returns
+   the laid-out box tree ROOT (so the caller can inspect it for in-view lazy images)."
   (multiple-value-bind (cv root styles)
       (let ((r:*image-loader* (page-image-loader pg))   ; network <img> over seal, cached
             (r:*font-loader* (page-font-loader pg))     ; @font-face web fonts over seal
             (r:*progress* #'report-progress)            ; :cascade / :layout / :painting
+            (r:*image-fetch-deadline* deadline)
+            (r:*fetch-inview-lazy* fetch-lazy)
             (fetch:*progress* nil) (seal:*progress* nil)) ; image/font fetches here aren't the document download
         ;; VIEWPORT-HEIGHT/SCROLL-TO only take effect when the page clips at the root
         ;; (a viewport-model page like Acid2); a normal page ignores them and its
@@ -627,7 +645,37 @@ Returns T when a config was found and applied."
           (page-styles pg) styles
           (page-content-height pg) (r:canvas-height cv)
           (page-scroll-y pg) (clamp-scroll (page-scroll-y pg)
-                                            (r:canvas-height cv) (page-viewport-height pg))))
+                                            (r:canvas-height cv) (page-viewport-height pg)))
+    root))
+
+(defun render-page (pg)
+  "Re-cascade, lay out and paint PG's current document at its width (reader view:
+   the canvas grows to full content height; the shell blits a viewport slice).
+   Refreshes the canvas, box tree, styles and content height, and re-clamps the
+   scroll position.
+
+   loading=lazy <img>s are deferred by layout and only wanted when they lay out in
+   view (viewport + look-ahead), which is known only after positions exist.  So:
+   render once with the lazy pass in defer-only mode (the eager set is already warm
+   from the prefetch), collect the in-view lazy URLs from the box tree, warm THEM
+   concurrently off the layout thread (so slow image URLs don't serialise), then
+   render again to fill them from cache.  An image-light or all-eager page finds no
+   in-view lazy misses and renders just once (no overhead)."
+  (let ((deadline (+ (get-internal-real-time)
+                     (round (* *image-prefetch-budget* internal-time-units-per-second)))))
+    ;; Pass 1 — lazy images defer (learn their laid-out positions); eager cache
+    ;; misses still fetch under the budget as before.
+    (let* ((root (%render-once pg deadline nil))
+           (urls (and root (ignore-errors (r:inview-lazy-image-urls
+                                           root (page-viewport-height pg))))))
+      (when urls
+        ;; warm the in-view lazy set concurrently, then re-render to fill it (cache
+        ;; hits — the fresh budget still lets any straggler fetch once, bounded).
+        (join-threads-until
+         (prefetch-image-urls urls (page-image-loader pg) deadline fetch:*cookie-jar*
+                              *lazy-warm-concurrency*)
+         deadline)
+        (%render-once pg deadline t))))
   pg)
 
 (defun relayout (pg new-width &optional new-viewport-height)
