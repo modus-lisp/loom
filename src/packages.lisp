@@ -15,6 +15,7 @@
    ;; navigation instrumentation (for the inspector)
    #:*net-log* #:net-log-reset #:nav-elapsed-ms #:dom-node-counts
    #:render-page #:relayout
+   #:inview-lazy-pending-urls #:warm-image-urls #:warm-lazy-for-scroll
    #:page-doc
    #:page-canvas #:page-root #:page-styles #:page-width #:page-viewport-height
    #:page-scroll-y #:page-content-height #:page-title #:page-cursor
