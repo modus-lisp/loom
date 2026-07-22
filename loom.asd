@@ -28,7 +28,7 @@
                 + RFB input) with no SDL/X — the FFI-free display path.  This is
                 the everyday-driver UI (loom.glass:run-glass)."
   :version "0.0.1" :author "ynniv" :license "MIT"
-  :depends-on ("loom" "glass")
+  :depends-on ("loom" "glass" "glass/text")
   :components ((:module "src" :components ((:file "glass-shell")))))
 
 (defsystem "loom/test"
