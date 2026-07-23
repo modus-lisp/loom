@@ -36,6 +36,10 @@
   (dirty t)
   (running t)                           ; pump-loop keeps going while true
   (buttons 0)                           ; last RFB button mask (low 3 bits)
+  ;; navigation runs OFF the RFB/paint thread (see NAVIGATE) so a slow or hung
+  ;; page render can never freeze VNC input/output:
+  (navigating nil)                      ; T while a background load+render is in flight
+  (nav-seq 0)                           ; bumped per nav; a finished render swaps in only if still latest
   ;; scroll-triggered lazy image loading (see MAYBE-WARM-LAZY):
   (warmed (make-hash-table :test 'equal)) ; lazy img URLs already warm-attempted (no re-warm)
   (warming nil)                         ; T while a background warm+re-render is in flight
@@ -169,21 +173,47 @@
     (loom:render-page pg)
     pg))
 
-(defun navigate (app dest &key (record t))
-  "Load DEST in APP, updating the address bar + (with RECORD) the Back history.
-   Back/Forward pass RECORD nil and manage the stacks themselves."
-  (handler-case
-      (let ((new (load-start dest (glass-app-vw app) (glass-app-vh app))))
-        (when (and record (plusp (length (glass-app-url app))))
-          (push (glass-app-url app) (glass-app-back app))
-          (setf (glass-app-fwd app) '()))
+(defun %finish-navigation (app new dest seq)
+  "Swap a freshly-rendered page in as APP's current page, IF this nav (SEQ) is
+   still the latest one requested — a superseded (or failed) render is discarded.
+   Runs on the nav thread, so it takes the lock itself (unlike NAVIGATE's caller)."
+  (sb-thread:with-mutex ((glass-app-lock app))
+    (when (= seq (glass-app-nav-seq app))                ; latest wins; drop stale renders
+      (when new
         (setf (glass-app-page app) new
-              (glass-app-url app) (or (ignore-errors (loom:page-url new)) dest)
-              (glass-app-editing app) nil
-              (glass-app-dirty app) t)
+              (glass-app-url app) (or (ignore-errors (loom:page-url new)) dest))
         (wire-navigation app))
-    (error (e) (format *error-output* "~&loom.glass: navigate to ~a failed: ~a~%" dest e)
-      (setf (glass-app-editing app) nil (glass-app-dirty app) t))))
+      (setf (glass-app-navigating app) nil
+            (glass-app-editing app) nil
+            (glass-app-dirty app) t))))
+
+(defun navigate (app dest &key (record t))
+  "Load DEST in APP.  The network fetch + layout + JS all run on a BACKGROUND
+   thread so the RFB/paint thread is never blocked — a slow, huge, or infinitely
+   looping page can no longer freeze VNC.  The finished page swaps in atomically
+   under the lock; the newest navigation wins and stale renders are dropped.
+
+   The synchronous part (history + address bar + nav bookkeeping) runs UNDER THE
+   CALLER'S LOCK — NAVIGATE is invoked from ON-POINTER / ON-KEY, which already
+   hold GLASS-APP-LOCK, so it must NOT re-acquire it (that would self-deadlock)."
+  (when (and record (plusp (length (glass-app-url app))))
+    (push (glass-app-url app) (glass-app-back app))
+    (setf (glass-app-fwd app) '()))
+  (setf (glass-app-url app) dest                         ; show the destination immediately
+        (glass-app-editing app) nil
+        (glass-app-navigating app) t
+        (glass-app-dirty app) t)
+  (let ((seq (incf (glass-app-nav-seq app)))
+        (vw (glass-app-vw app)) (vh (glass-app-vh app)))
+    (sb-thread:make-thread
+     (lambda ()
+       (%finish-navigation
+        app
+        (handler-case (load-start dest vw vh)
+          (error (e) (format *error-output* "~&loom.glass: navigate to ~a failed: ~a~%" dest e)
+            nil))
+        dest seq))
+     :name "loom-glass-nav")))
 
 (defun go-back (app)
   (when (consp (glass-app-back app))
