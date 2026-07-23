@@ -29,7 +29,10 @@
                 the everyday-driver UI (loom.glass:run-glass)."
   :version "0.0.1" :author "ynniv" :license "MIT"
   :depends-on ("loom" "glass" "glass/text")
-  :components ((:module "src" :components ((:file "glass-shell")))))
+  :components ((:module "src" :serial t
+                :components ((:file "ui")            ; immediate-mode widget kit over glass
+                             (:file "nav")           ; navigation tree (nodes / cursor / branching)
+                             (:file "glass-shell"))))) ; the browser shell (chrome + input + pump)
 
 (defsystem "loom/test"
   :description "Headless tests for loom: the pure logic (hit-testing, pointer->DOM

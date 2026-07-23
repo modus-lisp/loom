@@ -14,11 +14,6 @@
 ;;;; weft), and a pump loop advances timers and repaints.  weft's JS context is
 ;;;; not reentrant, so a single mutex serialises input handling against the pump.
 
-(defpackage #:loom.glass
-  (:use #:cl)
-  (:local-nicknames (#:r #:weft.render))
-  (:export #:serve #:run-glass #:attach #:attach-browser #:pump-loop #:on-key #:on-pointer #:stop
-           #:glass-app #:glass-app-page #:glass-app-fb))
 (in-package #:loom.glass)
 
 (defstruct glass-app
@@ -30,16 +25,19 @@
   (editing nil)                         ; is the address bar being edited?
   (edit-buf "")                         ; the address-bar text while editing
   (edit-sel nil)                        ; text is "selected" (click-to-edit) — next key replaces it
-  (back '())                            ; history: visited locations behind us
-  (fwd '())                             ; locations ahead (after going Back)
+  ;; --- navigation TREE (see nav.lisp): every navigation adds a child, nothing
+  ;; is destroyed; the cursor is the node shown.  back/fwd are tree traversal now.
+  (root nil)                            ; the tree's root node
+  (cursor nil)                          ; the currently-shown node
+  (next-id 0)                           ; monotonic node id / created tick
+  (edit-parent nil)                     ; node a pending address-bar nav attaches under
+  (uiframe nil)                         ; last painted ui frame (its hit-list drives clicks)
+  (px -1) (py -1)                       ; last pointer position (chrome hover)
+  (anim 0.0)                            ; spinner phase (advanced while any node loads)
   (lock (sb-thread:make-mutex :name "loom-glass-page"))
   (dirty t)
   (running t)                           ; pump-loop keeps going while true
   (buttons 0)                           ; last RFB button mask (low 3 bits)
-  ;; navigation runs OFF the RFB/paint thread (see NAVIGATE) so a slow or hung
-  ;; page render can never freeze VNC input/output:
-  (navigating nil)                      ; T while a background load+render is in flight
-  (nav-seq 0)                           ; bumped per nav; a finished render swaps in only if still latest
   ;; scroll-triggered lazy image loading (see MAYBE-WARM-LAZY):
   (warmed (make-hash-table :test 'equal)) ; lazy img URLs already warm-attempted (no re-warm)
   (warming nil)                         ; T while a background warm+re-render is in flight
@@ -57,27 +55,28 @@
 (defun paint (app)
   "Copy the visible slice of the page canvas (at the current scroll offset) into
    the glass framebuffer, packing RGB8 -> 0x00RRGGBB.  The page occupies the rows
-   BELOW the chrome bar (CHROME-H, 0 for a bare page); rows past the content end are
-   white and the chrome (if any) is drawn on top.  Assumes the caller holds the lock."
+   BELOW the chrome bar (CHROME-H, 0 for a bare page); rows past the content end
+   (or the whole area, if the cursor node is still LOADING and has no page yet) are
+   white.  The chrome is then drawn on top by the widget kit.  Caller holds the lock."
   (let* ((pg (glass-app-page app))
-         (cv (loom:page-canvas pg))
-         (cw (r:canvas-width cv))
-         (ch (r:canvas-height cv))
-         (px (r:canvas-pixels cv))
+         (cv (and pg (loom:page-canvas pg)))
+         (cw (if cv (r:canvas-width cv) 0))
+         (ch (if cv (r:canvas-height cv) 0))
+         (px (and cv (r:canvas-pixels cv)))
          (fb (glass-app-fb app))
          (fbpx (glass:fb-pixels fb))
          (fbw (glass:fb-width fb))
          (fbh (glass:fb-height fb))
          (ch-h (glass-app-chrome-h app))
          (page-h (- fbh ch-h))
-         (sy (min (loom:page-scroll-y pg) (max 0 (- ch page-h))))
+         (sy (if pg (min (loom:page-scroll-y pg) (max 0 (- ch page-h))) 0))
          (cols (min cw fbw)))
     (glass:with-fb-locked (fb)
       (dotimes (y page-h)
         (let ((cy (+ sy y))
               (drow (* (+ y ch-h) fbw)))            ; page starts CH-H rows down
           (cond
-            ((< cy ch)
+            ((and px (< cy ch))
              (let ((srow (* cy cw 3)))
                (dotimes (x cols)
                  (let ((o (+ srow (* x 3))))
@@ -87,66 +86,68 @@
                                  (aref px (+ o 2))))))
                (loop for x from cols below fbw do (setf (aref fbpx (+ drow x)) #xffffff))))
             (t (loop for x from 0 below fbw do (setf (aref fbpx (+ drow x)) #xffffff))))))
-      (when (plusp ch-h) (draw-chrome app)))))
+      (when (plusp ch-h) (render-chrome app)))))
 
 ;;; ---------------------------------------------------------------------------
-;;; Browser chrome — a toolbar: [<] [>] [reload]  [ address bar ]
+;;; Browser chrome — breadcrumb spine + branch rail, drawn with the widget kit.
 ;;; ---------------------------------------------------------------------------
-(defparameter +chrome-h+ 34)                 ; toolbar height
-(defparameter +btn-w+ 28)                    ; nav-button width/height box
-(defun %btn-x (i) (+ 4 (* i (+ +btn-w+ 2)))) ; left edge of nav button I (0=back,1=fwd,2=reload)
-(defun %addr-x () (+ (%btn-x 3) 4))          ; address bar left edge
-(defun %grey (n) (glass:rgb n n n))
+;;; Two thin rows over the page:
+;;;   row 1  [◄][►] news.yc › item3 › (b)                      ⟳ / spinner
+;;;   row 2  siblings ( a )( b* )   children — …   + new
+;;; render-chrome emits widgets via loom.ui; each clickable one pushes a hit rect
+;;; tagged with an ACTION (a keyword or a (kind . node) cons).  The ui frame is
+;;; stashed on the app so ON-POINTER can turn a chrome click into that action.
+(defparameter +row1-y+ 4)   (defparameter +row1-h+ 30)
+(defparameter +row2-y+ 37)  (defparameter +row2-h+ 22)
+(defparameter +chrome-h+ 63)
 
-(defun %arrow (fb bx dir enabled)
-  "A small left/right filled triangle centred in the nav button at column BX."
-  (let ((color (if enabled (%grey 60) (%grey 170))) (h 6) (cy (floor +chrome-h+ 2))
-        (lx (+ bx 10)) (rx (+ bx 19)))
-    (loop for dy from (- h) to h
-          for frac = (/ (abs dy) h) do
-      (if (eq dir :left)
-          (let ((e (round (+ lx (* frac (- rx lx)))))) (glass:fb-hline fb e (+ cy dy) (max 0 (- rx e)) color))
-          (let ((e (round (- rx (* frac (- rx lx)))))) (glass:fb-hline fb lx (+ cy dy) (max 0 (- e lx)) color))))))
+(defun any-loading-p (app)
+  "Is the cursor (the visible node) still loading?  Drives the spinner/progress."
+  (let ((c (glass-app-cursor app))) (and c (nav-node-loading c))))
 
-(defun %reload-icon (fb bx enabled)
-  "A reload glyph: a ~3/4 ring with a little arrowhead."
-  (let ((color (if enabled (%grey 60) (%grey 170))) (cx (+ bx 14)) (cy (floor +chrome-h+ 2)) (r 6))
-    (loop for deg from 20 to 300 by 6
-          for a = (* deg (/ pi 180.0d0))
-          for x = (round (+ cx (* r (cos a)))) for y = (round (+ cy (* r (sin a))))
-          do (glass:fb-rect fb x y 2 2 color))
-    ;; arrowhead at the arc's end (~300 deg, upper right)
-    (let ((ax (round (+ cx (* r (cos (* 300 (/ pi 180.0d0))))))) (ay (round (+ cy (* r (sin (* 300 (/ pi 180.0d0))))))))
-      (glass:fb-rect fb (- ax 1) (- ay 3) 4 2 color)
-      (glass:fb-rect fb (+ ax 1) (- ay 3) 2 5 color))))
-
-(defun draw-chrome (app)
-  "Draw the toolbar into the top +CHROME-H+ rows of the fb.  Caller holds the lock."
-  (let* ((fb (glass-app-fb app)) (fbw (glass:fb-width fb))
-         (back-on (consp (glass-app-back app))) (fwd-on (consp (glass-app-fwd app))))
-    (glass:fb-rect fb 0 0 fbw +chrome-h+ (%grey 224))               ; toolbar background
-    (glass:fb-hline fb 0 (1- +chrome-h+) fbw (%grey 150))           ; bottom divider
-    ;; nav buttons
-    (dotimes (i 3)
-      (let ((bx (%btn-x i)))
-        (glass:fb-rect fb bx 3 +btn-w+ (- +chrome-h+ 6) (%grey 236))
-        (glass:fb-frame fb bx 3 +btn-w+ (- +chrome-h+ 6) (%grey 160) 1)))
-    (%arrow fb (%btn-x 0) :left back-on)
-    (%arrow fb (%btn-x 1) :right fwd-on)
-    (%reload-icon fb (%btn-x 2) t)
-    ;; address bar
-    (let* ((ax (%addr-x)) (aw (- fbw ax 5)) (ay 5) (ah (- +chrome-h+ 10))
-           (editing (glass-app-editing app))
-           (text (if editing (glass-app-edit-buf app) (glass-app-url app))))
-      (glass:fb-rect fb ax ay aw ah (glass:rgb 255 255 255))
-      (glass:fb-frame fb ax ay aw ah (%grey (if editing 90 160)) 1)
-      (when (and editing (glass-app-edit-sel app) (plusp (length text)))  ; selection highlight
-        (glass:fb-rect fb (+ ax 5) (+ ay 2) (min (+ 2 (glass:text-width text :size 13)) (- aw 8)) (- ah 4)
-                       (glass:rgb 180 210 250)))
-      (glass:fb-text fb (+ ax 6) (+ ay 4) text :size 13 :color (%grey 30))
-      (when (and editing (not (glass-app-edit-sel app)))            ; caret at end of text
-        (let ((cx (+ ax 6 (glass:text-width text :size 13) 1)))
-          (glass:fb-vline fb (min cx (- (+ ax aw) 3)) (+ ay 3) (- ah 6) (%grey 30)))))))
+(defun render-chrome (app)
+  "Draw the breadcrumb+rail chrome via the kit and stash the frame's hit-list on
+   the app.  Caller holds the lock."
+  (let* ((fb (glass-app-fb app)) (w (glass:fb-width fb))
+         (u (ui:begin-frame fb :px (glass-app-px app) :py (glass-app-py app)))
+         (cursor (glass-app-cursor app))
+         (loading (any-loading-p app)))
+    (ui:fill-bg u 0 +chrome-h+)
+    ;; ---- row 1: back / forward + breadcrumb (or address field) + status ----
+    (ui:row u 6 +row1-y+ +row1-h+)
+    (ui:icon-button u :back :back :enabled (and cursor (nav-node-parent cursor)))
+    (ui:icon-button u :forward :forward :enabled (and cursor (nav-node-children cursor)))
+    (ui:gap u 6)
+    (if (glass-app-editing app)
+        ;; editing: the spine becomes an address field spanning to the status area
+        (ui:text-field u :address (glass-app-edit-buf app)
+                       :focus t :selected (glass-app-edit-sel app) :right-margin 40)
+        ;; else: the breadcrumb spine, each crumb a jump target; current = accent chip
+        (loop with path = (and cursor (nav-path cursor))
+              for rest on path for node = (car rest) for last = (null (cdr rest))
+              do (ui:breadcrumb-crumb u (cons :crumb node) (nav-label node :max (if last 40 22))
+                                      :current last)
+                 (unless last (ui:crumb-sep u))))
+    ;; right-aligned status: spinner while loading, else reload
+    (ui:row u (- w 34) +row1-y+ +row1-h+)
+    (if loading (ui:spinner u (glass-app-anim app)) (ui:icon-button u :reload :reload :enabled cursor))
+    (when loading (ui:row u 0 (+ +row1-y+ +row1-h+ 1) 2) (ui:progress-bar u 0.65))
+    (ui:divider u (+ +row1-y+ +row1-h+ 2))
+    ;; ---- row 2: branch rail — siblings (jump sideways) + children (jump in) ----
+    (ui:row u 12 +row2-y+ +row2-h+)
+    (when cursor
+      (let ((sibs (nav-siblings cursor)) (kids (nav-children cursor)))
+        (when (cdr sibs)                                 ; only show siblings if there's a choice
+          (ui:label u "siblings" :size 11) (ui:gap u 8)
+          (dolist (s sibs) (ui:chip u (cons :goto s) (nav-label s :max 16) :active (eq s cursor)) (ui:gap u 6))
+          (ui:gap u 12))
+        (ui:label u "children" :size 11) (ui:gap u 8)
+        (if kids
+            (dolist (k kids) (ui:chip u (cons :goto k) (nav-label k :max 16)) (ui:gap u 6))
+            (progn (ui:label u "none yet" :size 12) (ui:gap u 8)))
+        (ui:chip u :new "+ new")))
+    (ui:divider u (1- +chrome-h+))
+    (setf (glass-app-uiframe app) u)))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Navigation — a followed link loads a fresh page at the same viewport
@@ -173,110 +174,148 @@
     (loom:render-page pg)
     pg))
 
-(defun %finish-navigation (app new dest seq)
-  "Swap a freshly-rendered page in as APP's current page, IF this nav (SEQ) is
-   still the latest one requested — a superseded (or failed) render is discarded.
-   Runs on the nav thread, so it takes the lock itself (unlike NAVIGATE's caller)."
-  (sb-thread:with-mutex ((glass-app-lock app))
-    (when (= seq (glass-app-nav-seq app))                ; latest wins; drop stale renders
-      (when new
-        (setf (glass-app-page app) new
-              (glass-app-url app) (or (ignore-errors (loom:page-url new)) dest))
-        (wire-navigation app))
-      (setf (glass-app-navigating app) nil
-            (glass-app-editing app) nil
-            (glass-app-dirty app) t))))
-
-(defun navigate (app dest &key (record t))
-  "Load DEST in APP.  The network fetch + layout + JS all run on a BACKGROUND
-   thread so the RFB/paint thread is never blocked — a slow, huge, or infinitely
-   looping page can no longer freeze VNC.  The finished page swaps in atomically
-   under the lock; the newest navigation wins and stale renders are dropped.
-
-   The synchronous part (history + address bar + nav bookkeeping) runs UNDER THE
-   CALLER'S LOCK — NAVIGATE is invoked from ON-POINTER / ON-KEY, which already
-   hold GLASS-APP-LOCK, so it must NOT re-acquire it (that would self-deadlock)."
-  (when (and record (plusp (length (glass-app-url app))))
-    (push (glass-app-url app) (glass-app-back app))
-    (setf (glass-app-fwd app) '()))
-  (setf (glass-app-url app) dest                         ; show the destination immediately
+(defun nav-goto (app node)
+  "Move the cursor to NODE and show its page (blank while it is still loading)."
+  (setf (glass-app-cursor app) node
+        (glass-app-page app) (nav-node-page node)
+        (glass-app-url app) (nav-node-url node)
         (glass-app-editing app) nil
-        (glass-app-navigating app) t
         (glass-app-dirty app) t)
-  (let ((seq (incf (glass-app-nav-seq app)))
-        (vw (glass-app-vw app)) (vh (glass-app-vh app)))
+  (when (nav-node-page node) (wire-navigation app))
+  node)
+
+(defun %spawn-render (app dest on-done)
+  "Render DEST on a BACKGROUND thread (never the RFB/paint thread), then call
+   (ON-DONE page-or-nil) under the lock.  ON-DONE decides where the page lands.
+   This is what keeps a slow/huge/looping page from ever freezing VNC."
+  (let ((vw (glass-app-vw app)) (vh (glass-app-vh app)))
     (sb-thread:make-thread
      (lambda ()
-       (%finish-navigation
-        app
-        (handler-case (load-start dest vw vh)
-          (error (e) (format *error-output* "~&loom.glass: navigate to ~a failed: ~a~%" dest e)
-            nil))
-        dest seq))
+       (let ((pg (handler-case (load-start dest vw vh)
+                   (error (e) (format *error-output* "~&loom.glass: load ~a failed: ~a~%" dest e) nil))))
+         (sb-thread:with-mutex ((glass-app-lock app)) (funcall on-done pg))))
      :name "loom-glass-nav")))
 
+(defun navigate (app dest &key (parent (glass-app-cursor app)))
+  "Open DEST as a NEW child of PARENT (default: the current node) and move there.
+   The node appears at once in a loading state (chrome shows the spinner); its page
+   renders on a background thread, then fills the node.  Nothing is overwritten —
+   every navigation BRANCHES the tree, so Back/Forward/sideways are all traversal.
+   The synchronous part runs under the caller's lock (ON-POINTER/ON-KEY hold it)."
+  (let ((node (make-nav-node :id (incf (glass-app-next-id app)) :created (glass-app-next-id app)
+                             :url dest :parent parent :loading t)))
+    (nav-add-child parent node)
+    (unless (glass-app-root app) (setf (glass-app-root app) node))   ; very first nav = the root
+    (nav-goto app node)                                              ; cursor -> the loading node
+    (%spawn-render app dest
+      (lambda (pg)
+        (setf (nav-node-page node) pg (nav-node-loading node) nil)
+        (if pg
+            (setf (nav-node-url node)   (or (ignore-errors (loom:page-url pg)) dest)
+                  (nav-node-title node) (or (ignore-errors (loom:page-title pg)) ""))
+            (setf (nav-node-error node) t))
+        (when (eq (glass-app-cursor app) node)                       ; still viewing it? sync + wire
+          (setf (glass-app-page app) pg (glass-app-url app) (nav-node-url node))
+          (when pg (wire-navigation app)))
+        (setf (glass-app-dirty app) t)))
+    node))
+
 (defun go-back (app)
-  (when (consp (glass-app-back app))
-    (push (glass-app-url app) (glass-app-fwd app))
-    (navigate app (pop (glass-app-back app)) :record nil)))
+  "Up to the parent node (nothing lost — the branch we leave stays in the tree)."
+  (let ((c (glass-app-cursor app)))
+    (when (and c (nav-node-parent c)) (nav-goto app (nav-node-parent c)))))
 (defun go-forward (app)
-  (when (consp (glass-app-fwd app))
-    (push (glass-app-url app) (glass-app-back app))
-    (navigate app (pop (glass-app-fwd app)) :record nil)))
+  "Down into the most-recently-opened child branch."
+  (let ((c (glass-app-cursor app)))
+    (when (and c (nav-node-children c)) (nav-goto app (nav-latest-child c)))))
 (defun reload-page (app)
-  (when (plusp (length (glass-app-url app))) (navigate app (glass-app-url app) :record nil)))
+  "Re-render the current node's URL in place — replaces its page, keeps the node."
+  (let ((node (glass-app-cursor app)))
+    (when node
+      (setf (nav-node-loading node) t (glass-app-dirty app) t)
+      (%spawn-render app (nav-node-url node)
+        (lambda (pg)
+          (when pg (setf (nav-node-page node) pg))
+          (setf (nav-node-loading node) nil)
+          (when (eq (glass-app-cursor app) node)
+            (setf (glass-app-page app) (nav-node-page node))
+            (when (nav-node-page node) (wire-navigation app)))
+          (setf (glass-app-dirty app) t))))))
 
 (defun wire-navigation (app)
-  "Install the page's on-navigate callback so a clicked link loads in this app
-   (through NAVIGATE, so the address bar + Back history follow along)."
-  (setf (loom:page-on-navigate (glass-app-page app))
-        (lambda (pg target) (declare (ignore pg)) (navigate app target))))
+  "Install the current page's on-navigate callback so a clicked link opens a new
+   CHILD of the current node (a branch), through NAVIGATE."
+  (let ((pg (glass-app-page app)))
+    (when pg (setf (loom:page-on-navigate pg)
+                   (lambda (p target) (declare (ignore p)) (navigate app target))))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; RFB input -> page-model calls (the SDL shell's handle-event, over RFB)
 ;;; ---------------------------------------------------------------------------
 ;;; RFB button mask: bit0 left, bit1 middle, bit2 right; bits 3/4 = wheel up/down
 ;;; (transient).  DOM button numbers: left 0, middle 1, right 2.
-(defun %in-btn (x i) (<= (%btn-x i) x (+ (%btn-x i) +btn-w+)))
+(defun start-edit (app buf parent &key (selected t))
+  "Enter address-editing: the breadcrumb spine becomes a text field over BUF, and
+   pressing Enter navigates a new child of PARENT."
+  (setf (glass-app-editing app) t
+        (glass-app-edit-buf app) buf
+        (glass-app-edit-sel app) selected
+        (glass-app-edit-parent app) parent
+        (glass-app-dirty app) t))
 
-(defun chrome-pointer (app mask x)
-  "Handle a pointer event in the toolbar strip (only left-press acts)."
-  (let ((press-edge (and (logtest mask 1) (not (logtest (glass-app-buttons app) 1)))))
+(defun chrome-action (app action)
+  "Dispatch a chrome hit-list ACTION (a keyword, or a (kind . node) cons)."
+  (cond
+    ((eq action :back)    (go-back app))
+    ((eq action :forward) (go-forward app))
+    ((eq action :reload)  (reload-page app))
+    ((eq action :address))                                 ; click inside the field: keep editing
+    ((eq action :new)                                      ; a new top-level branch off the root
+     (start-edit app "" (or (glass-app-root app) (glass-app-cursor app)) :selected nil))
+    ((and (consp action) (eq (car action) :goto)) (nav-goto app (cdr action)))
+    ((and (consp action) (eq (car action) :crumb))
+     (let ((node (cdr action)))
+       (if (eq node (glass-app-cursor app))
+           (start-edit app (nav-node-url node) node)       ; edit the current URL -> Enter opens a child
+           (nav-goto app node))))))                        ; a past crumb -> jump straight there
+
+(defun chrome-pointer (app mask x y)
+  "A left-press in the chrome dispatches the hit-list action under (X,Y)."
+  (let ((press-edge (and (logtest mask 1) (not (logtest (glass-app-buttons app) 1))))
+        (frame (glass-app-uiframe app)))
     (setf (glass-app-buttons app) (logand mask 7))
     (when press-edge
-      (cond
-        ((%in-btn x 0) (go-back app))
-        ((%in-btn x 1) (go-forward app))
-        ((%in-btn x 2) (reload-page app))
-        ((>= x (%addr-x))                                   ; click the address bar -> edit (all selected)
-         (setf (glass-app-editing app) t
-               (glass-app-edit-buf app) (glass-app-url app)
-               (glass-app-edit-sel app) t                   ; whole URL selected: next key replaces it
-               (glass-app-dirty app) t))))))
+      (let ((action (and frame (ui:hit-at frame x y))))
+        (cond (action (chrome-action app action))
+              ((glass-app-editing app)                     ; press on empty chrome cancels editing
+               (setf (glass-app-editing app) nil (glass-app-dirty app) t)))))))
 
 (defun on-pointer (app mask x y)
   (sb-thread:with-mutex ((glass-app-lock app))
     (let ((ch-h (glass-app-chrome-h app)))
       (cond
-        ((and (plusp ch-h) (< y ch-h))                     ; in the toolbar
-         (chrome-pointer app mask x))
+        ((and (plusp ch-h) (< y ch-h))                     ; in the chrome
+         (setf (glass-app-px app) x (glass-app-py app) y   ; track pointer for hover
+               (glass-app-dirty app) t)
+         (chrome-pointer app mask x y))
         (t                                                 ; in the page (offset past the chrome)
+         (setf (glass-app-px app) -1 (glass-app-py app) -1) ; no chrome widget is hot
          (when (glass-app-editing app)                     ; clicking the page ends address editing
            (setf (glass-app-editing app) nil (glass-app-dirty app) t))
-         (let* ((pg (glass-app-page app))
-                (py (- y ch-h))
-                (real (logand mask 7))
-                (changed (logxor real (glass-app-buttons app))))
-           (when (logtest mask 8)  (loom:mouse-wheel pg 1))
-           (when (logtest mask 16) (loom:mouse-wheel pg -1))
-           (loom:mouse-move pg x py)
-           (dotimes (b 3)
-             (when (logbitp b changed)
-               (if (logbitp b real)
-                   (loom:mouse-press pg x py b)
-                   (loom:mouse-release pg x py b))))
-           (setf (glass-app-buttons app) real
-                 (glass-app-dirty app) t)))))))
+         (let ((pg (glass-app-page app)))
+           (when pg                                        ; a loading node has no page yet
+             (let* ((py (- y ch-h)) (real (logand mask 7))
+                    (changed (logxor real (glass-app-buttons app))))
+               (when (logtest mask 8)  (loom:mouse-wheel pg 1))
+               (when (logtest mask 16) (loom:mouse-wheel pg -1))
+               (loom:mouse-move pg x py)
+               (dotimes (b 3)
+                 (when (logbitp b changed)
+                   (if (logbitp b real)
+                       (loom:mouse-press pg x py b)
+                       (loom:mouse-release pg x py b))))
+               (setf (glass-app-dirty app) t)))
+           (setf (glass-app-buttons app) (logand mask 7))))))))
 
 (defun keysym-name (keysym)
   "A DOM key string for a non-printable X keysym (thin — enough for keydown to
@@ -302,9 +341,10 @@
   "Feed a keystroke to the address bar while it's being edited.  When the text is
    SELECTED (just clicked), the next edit replaces it whole."
   (cond
-    ((= keysym #xff0d)                                     ; Enter -> go
+    ((= keysym #xff0d)                                     ; Enter -> open the URL as a new branch
      (setf (glass-app-editing app) nil (glass-app-edit-sel app) nil)
-     (navigate app (normalize-input (glass-app-edit-buf app))))
+     (navigate app (normalize-input (glass-app-edit-buf app))
+               :parent (or (glass-app-edit-parent app) (glass-app-cursor app))))
     ((= keysym #xff1b)                                     ; Escape -> cancel
      (setf (glass-app-editing app) nil (glass-app-edit-sel app) nil (glass-app-dirty app) t))
     ((= keysym #xff08)                                     ; Backspace (clears all if selected)
@@ -353,7 +393,7 @@
    the last check, and throttled to *LAZY-CHECK-INTERVAL*; each URL is warmed at most once
    (a failed/offline image never re-triggers).  The slow network fetch runs off the page
    lock; only the final re-render (canvas swap) takes the lock, so the paint loop is smooth."
-  (when (glass-app-warming app)
+  (when (or (glass-app-warming app) (null (glass-app-page app)))  ; nothing to warm on a loading node
     (return-from maybe-warm-lazy nil))
   (let ((now (get-internal-real-time)))
     (when (< (/ (- now (glass-app-last-lazy-check app)) internal-time-units-per-second)
@@ -395,7 +435,11 @@
   (loop with i = 0
         while (and (glass-app-running app) (or (null max-iterations) (< i max-iterations)))
         do (sb-thread:with-mutex ((glass-app-lock app))
-             (when (loom::pump (glass-app-page app)) (setf (glass-app-dirty app) t))
+             (let ((pg (glass-app-page app)))
+               (when (and pg (loom::pump pg)) (setf (glass-app-dirty app) t)))
+             (when (any-loading-p app)                     ; keep the spinner turning while loading
+               (setf (glass-app-anim app) (mod (+ (glass-app-anim app) 0.04) 1.0)
+                     (glass-app-dirty app) t))
              (when (glass-app-dirty app)
                (paint app)
                (setf (glass-app-dirty app) nil)))
@@ -405,30 +449,38 @@
            (incf i)
            (unless max-iterations (sleep 1/60))))
 
+(defun %init-root (app pg fallback-url)
+  "Seed the navigation tree: wrap the already-rendered PG as the root node and
+   point the cursor at it."
+  (let ((node (make-nav-node :id (incf (glass-app-next-id app)) :created 1 :page pg
+                             :url (or (and pg (ignore-errors (loom:page-url pg))) fallback-url)
+                             :title (or (and pg (ignore-errors (loom:page-title pg))) ""))))
+    (setf (glass-app-root app) node (glass-app-cursor app) node
+          (glass-app-page app) pg (glass-app-url app) (nav-node-url node))
+    (wire-navigation app)
+    node))
+
 (defun attach (page fb)
   "Build an app driving PAGE into the EXISTING framebuffer FB (viewport = FB
-   size), wire link navigation, paint once, and return the app — WITHOUT owning a
+   size), seed the nav tree, paint once, and return the app — WITHOUT owning a
    server.  For embedding a live page as someone else's surface (e.g. a window in
    a compositor / window manager): the host forwards RFB input to ON-KEY /
    ON-POINTER and runs PUMP-LOOP to advance timers and repaint into FB."
-  (let ((app (make-glass-app :page page :fb fb
-                             :vw (glass:fb-width fb) :vh (glass:fb-height fb))))
-    (wire-navigation app)
+  (let ((app (make-glass-app :fb fb :vw (glass:fb-width fb) :vh (glass:fb-height fb))))
+    (%init-root app page (or (ignore-errors (loom:page-url page)) ""))
     (sb-thread:with-mutex ((glass-app-lock app)) (paint app))
     app))
 
 (defun attach-browser (start fb)
-  "Like ATTACH, but with browser CHROME (a toolbar: back / forward / reload + an
-   address bar) in the top strip; the page renders below it and its viewport is
-   sized accordingly.  START is a URL, a file, or \"about:blank\" (instant).  The
-   host forwards RFB input to ON-KEY / ON-POINTER and runs PUMP-LOOP as for ATTACH."
+  "Like ATTACH, but with browser CHROME (breadcrumb spine + branch rail) in the top
+   strip; the page renders below it and its viewport is sized accordingly.  START
+   is a URL, a file, or \"about:blank\" (instant).  The host forwards RFB input to
+   ON-KEY / ON-POINTER and runs PUMP-LOOP as for ATTACH."
   (let* ((ch-h +chrome-h+)
          (vw (glass:fb-width fb)) (vh (max 1 (- (glass:fb-height fb) ch-h)))
          (pg (load-start start vw vh))
-         (app (make-glass-app :page pg :fb fb :vw vw :vh vh
-                              :chrome-h ch-h
-                              :url (or (ignore-errors (loom:page-url pg)) start))))
-    (wire-navigation app)
+         (app (make-glass-app :fb fb :vw vw :vh vh :chrome-h ch-h)))
+    (%init-root app pg start)
     (sb-thread:with-mutex ((glass-app-lock app)) (paint app))
     app))
 
@@ -444,8 +496,8 @@
   (let* ((vw (loom:page-width page))
          (vh (loom:page-viewport-height page))
          (fb (glass:make-framebuffer vw vh (glass:rgb 255 255 255)))
-         (app (make-glass-app :page page :fb fb :vw vw :vh vh)))
-    (wire-navigation app)
+         (app (make-glass-app :fb fb :vw vw :vh vh)))
+    (%init-root app page (or (ignore-errors (loom:page-url page)) ""))
     (sb-thread:with-mutex ((glass-app-lock app)) (paint app))
     (sb-thread:make-thread
      (lambda () (glass:serve fb port
