@@ -10,7 +10,8 @@
                     (#:fetch #:weft.fetch) (#:url #:weft.url))
   (:export
    ;; page model
-   #:page #:page-p #:load-page #:load-url #:load-file
+   #:page #:page-p #:load-page #:load-url #:load-file #:load-pdf-bytes
+   #:*pdf-max-pages*
    #:*progress* #:report-progress
    ;; navigation instrumentation (for the inspector)
    #:*net-log* #:net-log-reset #:nav-elapsed-ms #:dom-node-counts

@@ -12,7 +12,7 @@
                 model with input translation and start-page helpers, driven by a
                 display backend (loom/glass).  Pure Common Lisp, no FFI."
   :version "0.0.1" :author "ynniv" :license "MIT"
-  :depends-on ("weft/render" "weft/script" "weft/fetch" "seal")
+  :depends-on ("weft/render" "weft/script" "weft/fetch" "seal" "folio")
   :serial t
   :components ((:module "src" :serial t
                 :components ((:file "packages")

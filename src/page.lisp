@@ -587,36 +587,250 @@ Returns T when a config was found and applied."
     (when start (push (subseq s start n) out))
     (nreverse out)))
 
+;;; ---------------------------------------------------------------------------
+;;; PDF documents — open application/pdf inline (folio -> a scrollable canvas)
+;;; ---------------------------------------------------------------------------
+;;; A PDF is not HTML: there is no DOM, no scripting, no links.  We render its
+;;; pages to bitmaps through folio (the pure-CL PDF renderer) and compose them
+;;; vertically into ONE tall page canvas — a light-gray document background with
+;;; each page centered above/below a small gap, exactly like a browser's inline
+;;; PDF viewer.  Because everything a PDF page needs is baked into PAGE-CANVAS,
+;;; the shell/webloom/glass scroll and blit it for free; the page's DOC/CTX stay
+;;; NIL and the HTML-assuming paths (hit-testing, timer pump, relayout, keys)
+;;; guard on them so a PDF page is inert rather than a crash.
+
+(defparameter *pdf-max-pages* 50
+  "Cap on how many PDF pages LOAD-PDF-BYTES rasterizes onto the page canvas: a
+   500-page book would otherwise take too long and produce a canvas too tall to
+   paint.  Pages past the cap are dropped and the title notes the truncation.")
+
+(defparameter *pdf-page-budget* 20.0
+  "Seconds LOAD-PDF-BYTES will spend rendering any ONE page before giving up on it
+   (a pathological page leaves a blank placeholder rather than hanging the load).")
+
+(defparameter *pdf-page-gap* 12
+  "Device-px gap composed between PDF pages, and the margin above the first / below
+   the last page — the whitespace a PDF viewer drops around each page.")
+
+(defparameter *pdf-bg* '(229 229 229)
+  "The light-gray document background painted behind the composed PDF pages.")
+
+(defparameter *pdf-fit-max-scale* 3.0d0
+  "Upper clamp on the fit-width scale so a tiny page isn't upscaled absurdly.")
+
+(defun %octets (x)
+  "Coerce X to a simple (unsigned-byte 8) vector (folio's parse-pdf input type)."
+  (if (typep x '(simple-array (unsigned-byte 8) (*)))
+      x
+      (coerce x '(simple-array (unsigned-byte 8) (*)))))
+
+(defun pdf-bytes-p (content-type body)
+  "True when a response is a PDF: CONTENT-TYPE names application/pdf, or BODY (an
+   octet vector) begins with the %PDF- magic.  Magic is trusted over a wrong or
+   missing content-type."
+  (or (and content-type (search "application/pdf" (string-downcase content-type)))
+      (and body (>= (length body) 5)
+           (= (aref body 0) 37)          ; %
+           (= (aref body 1) 80)          ; P
+           (= (aref body 2) 68)          ; D
+           (= (aref body 3) 70)          ; F
+           (= (aref body 4) 45))         ; -
+      nil))
+
+(defun %pdf-string->string (bytes)
+  "Decode a PDF text-string's BYTES: UTF-16BE when it carries the FE FF BOM,
+   else PDFDocEncoding treated as Latin-1 (good enough for a title/filename)."
+  (cond ((and (>= (length bytes) 2) (= (aref bytes 0) #xFE) (= (aref bytes 1) #xFF))
+         (with-output-to-string (o)
+           (loop for i from 2 below (1- (length bytes)) by 2
+                 do (write-char (code-char (logior (ash (aref bytes i) 8) (aref bytes (1+ i)))) o))))
+        (t (map 'string #'code-char bytes))))
+
+(defun pdf-doc-title (doc)
+  "The PDF's /Info /Title as a string, or NIL — never signals."
+  (ignore-errors
+    (let* ((tr (folio:document-trailer doc))
+           (info (and tr (folio:resolve doc (folio:dict-get tr "Info")))))
+      (when (folio:pdf-dict-p info)
+        (let ((title (folio:resolve doc (folio:dict-get info "Title"))))
+          (when (folio:pdf-string-p title)
+            (let ((s (%pdf-string->string (folio:pdf-string-bytes title))))
+              (and (plusp (length (string-trim '(#\Space #\Nul #\Newline #\Return) s))) s))))))))
+
+(defun url-filename (url)
+  "The last path segment of URL (its filename), or NIL."
+  (and (stringp url)
+       (let* ((u (subseq url 0 (or (position #\? url) (position #\# url) (length url))))
+              (slash (position #\/ u :from-end t))
+              (name (if slash (subseq u (1+ slash)) u)))
+         (and (plusp (length name)) name))))
+
+(defun blit-img-onto-canvas (cv img dx dy)
+  "Composite a straight-alpha PIGMENT:IMG onto the RGB weft canvas CV at (DX,DY),
+   alpha-blending each pixel over the existing (background) pixel.  Clipped to CV."
+  (let* ((cw (r:canvas-width cv)) (ch (r:canvas-height cv))
+         (cpx (r:canvas-pixels cv))
+         (iw (pigment:img-w img)) (ih (pigment:img-h img))
+         (ipx (pigment:img-rgba img)))
+    (declare (type (simple-array (unsigned-byte 8) (*)) cpx ipx)
+             (type fixnum cw ch iw ih dx dy))
+    (dotimes (y ih)
+      (let ((cy (+ dy y)))
+        (when (and (>= cy 0) (< cy ch))
+          (let ((srow (* y iw)) (drow (* cy cw)))
+            (dotimes (x iw)
+              (let ((cx (+ dx x)))
+                (when (and (>= cx 0) (< cx cw))
+                  (let* ((si (* 4 (+ srow x)))
+                         (di (* 3 (+ drow cx)))
+                         (a (aref ipx (+ si 3))))
+                    (cond
+                      ((= a 255)
+                       (setf (aref cpx di)       (aref ipx si)
+                             (aref cpx (+ di 1)) (aref ipx (+ si 1))
+                             (aref cpx (+ di 2)) (aref ipx (+ si 2))))
+                      ((> a 0)
+                       (let ((ia (- 255 a)))
+                         (setf (aref cpx di)
+                               (floor (+ (* (aref ipx si) a) (* (aref cpx di) ia)) 255)
+                               (aref cpx (+ di 1))
+                               (floor (+ (* (aref ipx (+ si 1)) a) (* (aref cpx (+ di 1)) ia)) 255)
+                               (aref cpx (+ di 2))
+                               (floor (+ (* (aref ipx (+ si 2)) a) (* (aref cpx (+ di 2)) ia)) 255)))))))))))))))
+
+(defun %html-escape (s)
+  (with-output-to-string (o)
+    (loop for c across (or s "")
+          do (case c (#\< (write-string "&lt;" o)) (#\> (write-string "&gt;" o))
+                     (#\& (write-string "&amp;" o)) (t (write-char c o))))))
+
+(defun pdf-error-page (message &key (width 1024) (viewport-height 768) url)
+  "A simple rendered page reporting that a PDF couldn't be opened (the fallback
+   for a malformed/encrypted document).  Built as HTML so it goes through the
+   normal render path (with a live DOC/CTX)."
+  (load-page (format nil "<!doctype html><meta charset=utf-8><body style=\"font-family:sans-serif;margin:3em;color:#222\"><h2>Couldn't display this PDF</h2><p>~a</p><p style=\"color:#888;word-break:break-all\">~a</p></body>"
+                     (%html-escape message) (%html-escape (or url "")))
+             :base (or url "") :url url :width width :viewport-height viewport-height))
+
+(defun load-pdf-bytes (bytes &key (width 1024) (viewport-height 768) url)
+  "Render a PDF (raw BYTES) to a scrollable PAGE: parse via folio, rasterize each
+   page (capped at *PDF-MAX-PAGES*) at a fit-width scale, and compose them
+   vertically — light-gray background, centered pages, a small gap — into ONE tall
+   canvas the shell scrolls and blits like an HTML page.  DOC/CTX stay NIL (a PDF
+   has no DOM/JS/links).  A malformed/encrypted PDF falls back to a plain error
+   page rather than crashing loom."
+  (handler-case
+      (let* ((doc (folio:parse-pdf (%octets bytes)))
+             (n (or (ignore-errors (folio:page-count doc)) 0)))
+        (when (or (null n) (<= n 0))
+          (return-from load-pdf-bytes
+            (pdf-error-page "The document has no pages." :width width
+                            :viewport-height viewport-height :url url)))
+        (let* ((count (min n (max 1 *pdf-max-pages*)))
+               (truncated (< count n))
+               (gap *pdf-page-gap*)
+               (avail (max 1 (- width (* 2 gap))))
+               (imgs '()))
+          (dotimes (i count)
+            (push
+             (handler-case
+                 (let* ((page (folio:get-page doc i))
+                        (mb (folio:page-mediabox page))
+                        (pw (max 1d0 (- (third mb) (first mb))))
+                        (scale (max 0.05d0 (min *pdf-fit-max-scale*
+                                                (/ (float avail 1d0) pw)))))
+                   (sb-ext:with-timeout *pdf-page-budget*
+                     (folio:render-page doc i :scale scale)))
+               (error () nil)
+               (sb-ext:timeout () nil))
+             imgs))
+          (setf imgs (nreverse imgs))
+          ;; a page that failed to render still reserves a blank slot so page
+          ;; numbers stay aligned with the document.
+          (let* ((slot-h (round (* 1.3d0 avail)))   ; placeholder height (~Letter aspect)
+                 (total (+ gap (loop for img in imgs
+                                     sum (+ (if img (pigment:img-h img) slot-h) gap))))
+                 (cv (r:make-canvas width (max 1 total) *pdf-bg*))
+                 (y gap))
+            (dolist (img imgs)
+              (cond
+                (img
+                 (let ((x (max 0 (floor (- width (pigment:img-w img)) 2))))
+                   (blit-img-onto-canvas cv img x y)
+                   (incf y (+ (pigment:img-h img) gap))))
+                (t
+                 (r:fill-rect cv gap y avail slot-h '(255 255 255))
+                 (incf y (+ slot-h gap)))))
+            (make-page :doc nil :ctx nil
+                       :canvas cv :content-height (max 1 total)
+                       :width width :viewport-height viewport-height
+                       :url url
+                       :title (let ((base (or (pdf-doc-title doc)
+                                              (url-filename url) "PDF")))
+                                (if truncated
+                                    (format nil "~a (first ~D of ~D pages)" base count n)
+                                    base))))))
+    (error (e)
+      (pdf-error-page (princ-to-string e) :width width
+                      :viewport-height viewport-height :url url))))
+
 (defun load-url (url-string &key (width 1024) (viewport-height 768) cookie-jar)
   "Fetch and load URL-STRING as a fresh page (the network browsing entry).
    COOKIE-JAR isolates this browsing context (default: the ambient jar); the caller
-   (a tab) supplies its context's jar so identity is per-context, not global."
+   (a tab) supplies its context's jar so identity is per-context, not global.
+   A response that is a PDF (content-type application/pdf or the %PDF- magic) opens
+   inline as a rendered, scrollable document; file:// URLs are read from disk."
+  ;; file:// is read from disk (no network); the same PDF-vs-HTML routing applies.
+  (when (url-prefix-p "file://" url-string)
+    (let ((path (subseq url-string 7 (or (position #\# url-string) (length url-string)))))
+      (return-from load-url
+        (load-file path :width width :viewport-height viewport-height :url url-string))))
   ;; Scope the fine network hooks to the MAIN document fetch: the resolve/TLS/
   ;; download detail is for the page itself, not for the many subresources that
   ;; load-page fetches afterward (those are summarized by :loading / :scripting).
   (let ((fetch:*cookie-jar* (or cookie-jar fetch:*cookie-jar*))
         (st (get-internal-real-time)))
-   (multiple-value-bind (text charset resp)
-      (let ((fetch:*progress* #'report-progress) (seal:*progress* #'report-progress))
-        (fetch:fetch-text url-string))
-    (declare (ignore charset))
-    (net-log-add url-string (rel-ms st) (nav-elapsed-ms) (and text (length text)) (and text t) :document)
-    (let* ((final (or (and resp (fetch:response-url resp)) url-string))
-           ;; the #fragment is client-side (never sent) — carry it as the scroll
-           ;; target so a viewport-model page (e.g. Acid2's test.html#top) composes.
-           (hash (position #\# url-string))
-           (frag (and hash (< (1+ hash) (length url-string)) (subseq url-string (1+ hash)))))
-      (load-page text :base final :url final :fragment frag
-                 :width width :viewport-height viewport-height
-                 :loader (make-http-loader final)
-                 :cookie-jar fetch:*cookie-jar*)))))
+   (let ((resp (let ((fetch:*progress* #'report-progress) (seal:*progress* #'report-progress))
+                 (fetch:fetch url-string))))
+    (let* ((headers (and resp (fetch:response-headers resp)))
+           (ctype (and headers (fetch:get-header headers "content-type")))
+           (raw (and resp (fetch:response-body resp)))
+           ;; strip Content-Encoding (gzip/br/…) so magic/parse see the real bytes
+           (body (and raw (or (ignore-errors (fetch:decompress-body headers raw)) raw)))
+           (final (or (and resp (fetch:response-url resp)) url-string)))
+      (net-log-add url-string (rel-ms st) (nav-elapsed-ms) (and body (length body)) (and body t) :document)
+      (if (pdf-bytes-p ctype body)
+          (load-pdf-bytes body :width width :viewport-height viewport-height :url final)
+          (let* ((text (nth-value 0 (fetch:body-text headers raw)))
+                 ;; the #fragment is client-side (never sent) — carry it as the scroll
+                 ;; target so a viewport-model page (e.g. Acid2's test.html#top) composes.
+                 (hash (position #\# url-string))
+                 (frag (and hash (< (1+ hash) (length url-string)) (subseq url-string (1+ hash)))))
+            (load-page text :base final :url final :fragment frag
+                       :width width :viewport-height viewport-height
+                       :loader (make-http-loader final)
+                       :cookie-jar fetch:*cookie-jar*)))))))
 
-(defun load-file (path &key (width 1024) (viewport-height 768))
-  "Load a local HTML file as a fresh page (the default/offline browsing entry)."
+(defun read-file-octets (path)
+  "Read the whole file at PATH into a fresh (unsigned-byte 8) vector."
+  (with-open-file (s path :element-type '(unsigned-byte 8))
+    (let ((buf (make-array (file-length s) :element-type '(unsigned-byte 8))))
+      (read-sequence buf s)
+      buf)))
+
+(defun load-file (path &key (width 1024) (viewport-height 768) url)
+  "Load a local file as a fresh page (the default/offline browsing entry).  A PDF
+   (the %PDF- magic) opens inline via folio; any other file is parsed as HTML.
+   URL overrides the page's own URL (default: the file:// URL of PATH)."
   (let* ((truename (uiop:truenamize path))
          (base (format nil "file://~a" (namestring truename)))
-         (html (uiop:read-file-string truename)))
-    (load-page html :base base :url base :width width :viewport-height viewport-height)))
+         (bytes (read-file-octets truename)))
+    (if (pdf-bytes-p nil bytes)
+        (load-pdf-bytes bytes :width width :viewport-height viewport-height :url (or url base))
+        ;; decode via the same path the old load-file used (exact HTML behavior)
+        (load-page (uiop:read-file-string truename)
+                   :base base :url (or url base)
+                   :width width :viewport-height viewport-height))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Rendering
@@ -664,7 +878,12 @@ Returns T when a config was found and applied."
    from the prefetch), collect the in-view lazy URLs from the box tree, warm THEM
    concurrently off the layout thread (so slow image URLs don't serialise), then
    render again to fill them from cache.  An image-light or all-eager page finds no
-   in-view lazy misses and renders just once (no overhead)."
+   in-view lazy misses and renders just once (no overhead).
+
+   A PDF page has no live document (DOC/CTX are NIL): its canvas is already
+   composed by LOAD-PDF-BYTES, so there is nothing to re-cascade — return it as-is."
+  (unless (page-doc pg)
+    (return-from render-page pg))
   (let ((deadline (+ (get-internal-real-time)
                      (round (* *image-prefetch-budget* internal-time-units-per-second)))))
     ;; Pass 1 — lazy images defer (learn their laid-out positions); eager cache
@@ -732,9 +951,12 @@ Returns T when a config was found and applied."
 
 (defun relayout (pg new-width &optional new-viewport-height)
   "Re-lay out PG at a new window width (and optionally viewport height) — the
-   response to a window resize."
+   response to a window resize.  A PDF page (no live document) keeps its composed
+   canvas; only its recorded width/viewport update."
   (setf (page-width pg) new-width)
   (when new-viewport-height (setf (page-viewport-height pg) new-viewport-height))
+  (unless (page-doc pg)
+    (return-from relayout pg))
   (ignore-errors (setf (ws::context-width (page-ctx pg)) new-width))
   (render-page pg))
 
@@ -745,7 +967,10 @@ Returns T when a config was found and applied."
   "Advance the timer/animation clock by one frame (so setTimeout/animations
    progress ~one step, not to the task cap), then re-render if a handler mutated
    the DOM.  Called after every dispatched event and once per idle frame.
-   Returns T when it re-rendered (the frame needs a fresh blit)."
+   Returns T when it re-rendered (the frame needs a fresh blit).
+   A no-op for a PDF page (no scripting context to pump)."
+  (unless (page-ctx pg)
+    (return-from pump nil))
   (ws:pump-timers (page-ctx pg) *frame-ms*)
   (when (ws:context-dirty (page-ctx pg))
     (render-page pg)
@@ -841,10 +1066,13 @@ Returns T when a config was found and applied."
                       (page-content-height pg) (page-viewport-height pg))))
 
 (defun key-target (pg)
-  "The node keyboard events target (no focus model yet — the body element)."
-  (or (css:query-select (page-doc pg) "body")
-      (css:query-select (page-doc pg) "html")
-      (page-doc pg)))
+  "The node keyboard events target (no focus model yet — the body element).
+   NIL for a PDF page (no document)."
+  (let ((doc (page-doc pg)))
+    (and doc
+         (or (css:query-select doc "body")
+             (css:query-select doc "html")
+             doc))))
 
 (defun key-down (pg key &key key-code)
   "Dispatch a trusted keydown for DOM key string KEY (\"a\", \"Enter\", …)."
