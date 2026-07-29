@@ -80,8 +80,13 @@ Or with the helper script:
 The correctness-critical logic lives in `input.lisp` + `page.lisp` and is fully
 unit-tested headlessly (`inspect/tests.lisp`): hit-testing, event translation,
 scroll clamping, URL resolution, and a full load → click → observe-the-DOM-react
-cycle. `inspect/smoke.lisp` exercises the glass display path end-to-end without a
-VNC client (attach a page to a framebuffer, pump the loop, write the render PNG).
+cycle. `inspect/forms-interact.lisp` gates the interactive form path by driving
+the shell the way a person does — clicking at pixel coordinates, typing — and
+asserting on both the DOM and the pixels that actually got painted. (weft's
+~2,800-subtest forms oracle only ever reads the DOM, so none of that path was
+visible to it.) `inspect/smoke.lisp` exercises the glass display path end-to-end
+without a VNC client (attach a page to a framebuffer, pump the loop, write the
+render PNG).
 
 weft's JS context is single-threaded, so the glass driver serialises the RFB
 client thread against the timer/repaint pump with one mutex.
@@ -89,8 +94,8 @@ client thread against the timer/repaint pump with one mutex.
 ## Tests
 
 ```sh
-# headless unit tests (pure logic + page model; no display needed)
-sbcl --eval '(ql:quickload :loom/test)' --eval '(uiop:quit (if (loom.test:run) 0 1))'
+# headless gates: pure logic + page model, and the form-interaction gate
+sbcl --eval '(asdf:test-system "loom")'
 
 # glass smoke test (load a real render, attach to a framebuffer, pump, write a PNG)
 sbcl --script inspect/smoke.lisp
@@ -102,8 +107,11 @@ confirms the page navigates and re-renders — no display required.
 
 ## Status / not yet
 
-- Editable text, form controls, focus and a text caret are a later round —
-  `keydown` is dispatched to the body as a thin start.
+- Form controls are interactive: clicking activates them (a checkbox toggles, a
+  radio takes its group, a submit button submits), clicking focuses and places
+  the caret, and typing edits the value with `input`/`change` fired where HTML
+  says. Selection (shift-arrows, drag), `<select>` dropdowns and tab-order
+  traversal are still to come.
 - CSS `:hover` restyling (recascading on hover) is deferred; JS hover handlers
   (`mouseover` / `mouseout`) and the pointer cursor already work.
 

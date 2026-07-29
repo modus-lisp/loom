@@ -36,10 +36,15 @@
 
 (defsystem "loom/test"
   :description "Headless tests for loom: the pure logic (hit-testing, pointer->DOM
-                translation, scroll math, URL resolution) and the page model
-                (load -> render -> dispatch a click -> observe the DOM react)."
+                translation, scroll math, URL resolution), the page model
+                (load -> render -> dispatch a click -> observe the DOM react),
+                and the form-interaction gate — click/type at pixel coordinates
+                and assert on both the DOM and what got painted."
   :depends-on ("loom")
-  :components ((:module "inspect" :components ((:file "tests"))))
+  :components ((:module "inspect" :components ((:file "tests") (:file "forms-interact"))))
   :perform (test-op (o c)
-             (unless (uiop:symbol-call :loom.test :run)
-               (error "loom: test failures"))))
+             ;; run BOTH, then decide: a failure in one should not hide the
+             ;; other's result, which is the whole point of having two gates.
+             (let* ((core  (uiop:symbol-call :loom.test :run))
+                    (forms (uiop:symbol-call :loom.forms-interact :run)))
+               (unless (and core forms) (error "loom: test failures")))))

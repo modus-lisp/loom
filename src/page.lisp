@@ -851,6 +851,12 @@ Returns T when a config was found and applied."
             ;; re-render after scrolling fills the images that entered view (not just the
             ;; top-of-document set).  At the initial load scroll-y is 0 — the original band.
             (r:*lazy-scroll-y* (float (page-scroll-y pg) 1.0))
+            ;; A form control's CURRENT value lives in the scripting context, not
+            ;; in its `value' attribute (which is the DEFAULT value).  Without this
+            ;; the painter would draw the default forever, so neither a script-set
+            ;; value nor anything the user typed would ever appear on screen.
+            (r:*form-value-fn* (and (page-ctx pg) (ws:live-form-value-fn (page-ctx pg))))
+            (r:*form-caret-fn* (and (page-ctx pg) (ws:live-form-caret-fn (page-ctx pg))))
             (fetch:*progress* nil) (seal:*progress* nil)) ; image/font fetches here aren't the document download
         ;; VIEWPORT-HEIGHT/SCROLL-TO only take effect when the page clips at the root
         ;; (a viewport-model page like Acid2); a normal page ignores them and its
@@ -1002,14 +1008,45 @@ Returns T when a config was found and applied."
 ;;; ---------------------------------------------------------------------------
 ;;; Input -> DOM events
 ;;; ---------------------------------------------------------------------------
+(defun focusable-ancestor (node)
+  "The control a click on NODE focuses: NODE or its nearest focusable ancestor,
+   so clicking the label text inside a <button> focuses the button.  NIL when the
+   click landed on nothing focusable (which clears focus back to the body)."
+  (loop for n = node then (h:dnode-parent n)
+        while n
+        when (and (eq (h:dnode-kind n) :element) (r:form-control-focusable-p n))
+          do (return n)))
+
+(defun focus-at (pg node vx vy)
+  "Move focus to the control under viewport point (VX,VY), and — when it is a
+   text control — put the caret where the pointer landed.  Commits any pending
+   edit first: HTML fires `change' before the `blur' that caused it."
+  (let* ((ctx (page-ctx pg))
+         (target (and node (focusable-ancestor node))))
+    (when ctx
+      (ws:commit-edit ctx)
+      (ws:set-focus ctx target)
+      (when (and target (ws:text-control-p target))
+        (let ((b (r:box-at (page-root pg) vx (+ vy (page-scroll-y pg)))))
+          (when (and b (eq (r:lbox-node b) target))
+            (ws:place-caret ctx target
+                            (r:caret-index-at target (ws:control-value ctx target)
+                                              (r:lbox-w b)
+                                              (- vx (r:lbox-x b))
+                                              (- (+ vy (page-scroll-y pg)) (r:lbox-y b))))))))
+    target))
+
 (defun mouse-press (pg vx vy &optional (button 0))
   "Route a mouse-button-down at viewport (VX,VY) to a trusted mousedown on
-   the hit node.  Returns the hit node."
+   the hit node, then move focus (a mousedown handler that calls preventDefault
+   suppresses the focus change, as in a browser).  Returns the hit node."
   (let ((n (node-at-page pg vx vy)))
     (setf (page-press-node pg) n)
-    (when n
-      (ws:dispatch-mouse-event (page-ctx pg) n "mousedown"
-                               :button button :client-x vx :client-y vy))
+    (let ((go (if n
+                  (ws:dispatch-mouse-event (page-ctx pg) n "mousedown"
+                                           :button button :client-x vx :client-y vy)
+                  t)))
+      (when (and go (zerop button)) (focus-at pg n vx vy)))
     (pump pg)
     n))
 
@@ -1066,24 +1103,31 @@ Returns T when a config was found and applied."
                       (page-content-height pg) (page-viewport-height pg))))
 
 (defun key-target (pg)
-  "The node keyboard events target (no focus model yet — the body element).
-   NIL for a PDF page (no document)."
+  "The node keyboard events target: the focused element, which is the body when
+   nothing holds focus.  NIL for a PDF page (no document)."
   (let ((doc (page-doc pg)))
     (and doc
-         (or (css:query-select doc "body")
+         (or (and (page-ctx pg) (ws:active-element (page-ctx pg)))
+             (css:query-select doc "body")
              (css:query-select doc "html")
              doc))))
 
 (defun key-down (pg key &key key-code)
-  "Dispatch a trusted keydown for DOM key string KEY (\"a\", \"Enter\", …)."
-  (let ((n (key-target pg)))
-    (when n (ws:dispatch-keyboard-event (page-ctx pg) n "keydown" :key key :key-code key-code))
+  "Dispatch a trusted keydown for DOM key string KEY (\"a\", \"Enter\", …), then
+   — unless a handler cancelled it — run the key's default action in the focused
+   text control (caret motion, Backspace/Delete, Enter)."
+  (let ((ctx (page-ctx pg)) (n (key-target pg)))
+    (when n
+      (when (and (ws:dispatch-keyboard-event ctx n "keydown" :key key :key-code key-code)
+                 ctx)
+        (ws:handle-editing-key ctx key)))
     (pump pg)))
 
 (defun key-text (pg text)
-  "Dispatch keypress for typed TEXT (a thin start; editable fields/caret are a
-   later round)."
-  (let ((n (key-target pg)))
+  "Dispatch keypress for typed TEXT, then — unless cancelled — insert it at the
+   caret of the focused text control."
+  (let ((ctx (page-ctx pg)) (n (key-target pg)))
     (when (and n (plusp (length text)))
-      (ws:dispatch-keyboard-event (page-ctx pg) n "keypress" :char text))
+      (when (and (ws:dispatch-keyboard-event ctx n "keypress" :char text) ctx)
+        (ws:handle-text-input ctx text)))
     (pump pg)))

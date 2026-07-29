@@ -137,13 +137,23 @@
               <script>var i=0;function s(){i++;document.getElementById('n').textContent=String(i);
               if(i<3)setTimeout(s,10);} setTimeout(s,10);</script></body>"
              :width 400 :viewport-height 300)))
-    ;; at load only 0-delay tasks run; the setTimeout(_,10) chain advances one
-    ;; step per frame pump (~16ms of virtual time each), not to the task cap.
-    (check "no timer fired at load"
-           (dom:text-content (dom:get-element-by-id (loom::page-doc pg) "n")) "0")
-    (dotimes (i 5) (loom::pump pg))     ; five frames -> the 3-step chain completes
-    (check "timer chain completed after frames"
-           (dom:text-content (dom:get-element-by-id (loom::page-doc pg) "n")) "3")))
+    ;; LOAD drains the macrotask queue (page.lisp, c7f18ff: a JS test runner or
+    ;; an SPA that bootstraps through setTimeout must finish, not stall on its
+    ;; first tick), so the whole chain has already run by the time load returns.
+    ;; This assertion used to read "no timer fired at load" — it was written
+    ;; before that change and had been failing ever since.
+    (check "chained timers complete during load"
+           (dom:text-content (dom:get-element-by-id (loom::page-doc pg) "n")) "3")
+    ;; a timer scheduled AFTER load is the frame pump's job: ~16ms of virtual
+    ;; clock per pump, one step at a time.
+    (shuttle:eval-script
+     (weft.script:context-realm (loom::page-ctx pg))
+     "setTimeout(function(){document.getElementById('n').textContent='later'},10)")
+    (check "post-load timer waits for a frame"
+           (dom:text-content (dom:get-element-by-id (loom::page-doc pg) "n")) "3")
+    (loom::pump pg)
+    (check "one frame runs it"
+           (dom:text-content (dom:get-element-by-id (loom::page-doc pg) "n")) "later")))
 
 (defun run ()
   (setf *pass* 0 *fail* 0)
