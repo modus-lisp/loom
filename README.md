@@ -104,6 +104,11 @@ sbcl --script inspect/smoke.lisp
 `inspect/glass-demo.lisp` closes the loop headlessly: it serves the bundled home
 page over VNC, sends a real RFB click on a link with an in-process RFB client, and
 confirms the page navigates and re-renders — no display required.
+`inspect/glass-forms.lisp` does the same for interaction: it serves a form, then
+clicks and types over the wire as real RFB `PointerEvent` / `KeyEvent` messages —
+focus, `.value`, a ticked checkbox and a submit that reads them all back. The
+headless gates drive the page model directly, so only this covers the layer above
+it (chrome offsets, keysym translation, the repaint pump).
 
 ## Status / not yet
 
