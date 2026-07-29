@@ -43,19 +43,23 @@
     (walk (loom:page-root pg))
     nil))
 
-(defun ink-in (pg id)
-  "Count of non-white pixels inside ID's box — how much is actually PAINTED
-   there.  This is the assertion the DOM-only oracles cannot make."
-  (let* ((b (or (box-of pg id) (error "no box for ~a" id)))
-         (cv (loom:page-canvas pg))
+(defun ink-rect (pg x y w h)
+  "Count of non-white pixels in the page-coordinate rect."
+  (let* ((cv (loom:page-canvas pg))
          (px (r:canvas-pixels cv)) (cw (r:canvas-width cv)) (ch (r:canvas-height cv))
          (n 0))
-    (loop for y from (max 0 (round (r:lbox-y b))) below (min ch (round (+ (r:lbox-y b) (r:lbox-h b))))
-          do (loop for x from (max 0 (round (r:lbox-x b))) below (min cw (round (+ (r:lbox-x b) (r:lbox-w b))))
-                   for i = (* 3 (+ x (* y cw)))
+    (loop for yy from (max 0 (round y)) below (min ch (round (+ y h)))
+          do (loop for xx from (max 0 (round x)) below (min cw (round (+ x w)))
+                   for i = (* 3 (+ xx (* yy cw)))
                    unless (and (> (aref px i) 250) (> (aref px (+ i 1)) 250) (> (aref px (+ i 2)) 250))
                      do (incf n)))
     n))
+
+(defun ink-in (pg id)
+  "Count of non-white pixels inside ID's box — how much is actually PAINTED
+   there.  This is the assertion the DOM-only oracles cannot make."
+  (let ((b (or (box-of pg id) (error "no box for ~a" id))))
+    (ink-rect pg (r:lbox-x b) (r:lbox-y b) (r:lbox-w b) (r:lbox-h b))))
 
 (defun click (pg id &key (dx 4) (dy 4))
   "Click the real pixels of ID's widget, as a pointer would."
@@ -90,6 +94,26 @@
    caret is painted from, which is the point of asserting on them here."
   (jstr pg (format nil "(function(e){return e.selectionStart+'-'+e.selectionEnd})~
                         (document.getElementById('~a'))" id)))
+
+(defun menu-geometry (pg id)
+  "(values x y w h row-h) of ID's dropdown list — the SAME geometry the painter
+   uses, so a test looks for the popup exactly where it would be drawn."
+  (let ((b (or (box-of pg id) (error "no box for ~a" id))))
+    (r:select-menu-geometry b (ws:select-labels (r:lbox-node b))
+                            (r:canvas-height (loom:page-canvas pg)))))
+
+(defun menu-ink (pg id)
+  "Non-white pixels where ID's dropdown list would be — 0 when it is closed."
+  (multiple-value-bind (x y w h) (menu-geometry pg id)
+    (ink-rect pg x y w h)))
+
+(defun menu-click (pg id row)
+  "Click ROW of ID's open dropdown."
+  (multiple-value-bind (x y w h row-h) (menu-geometry pg id)
+    (declare (ignore w h))
+    (let ((px (+ x 4)) (py (+ y 3 (* row row-h))))
+      (loom:mouse-press pg px py 0)
+      (loom:mouse-release pg px py 0))))
 
 (defun page (html &key (width 600))
   (let ((pg (loom:load-page html :url "about:forms-interact" :width width)))
@@ -352,20 +376,91 @@ for (var id of ['t','u']) { var e=document.getElementById(id);
     (press pg "ArrowDown" 40)
     (check "ArrowDown comes back" (sel pg "a") "7-7")))
 
+;;; ---- 7. the <select> dropdown ----------------------------------------------
+;;; The list has no layout box (it is painted over the page and gone on pick), so
+;;; MENU-INK asks the only question that matters: are those pixels on screen?
+(defparameter +select-page+
+  "<!doctype html><body>
+<select id=s><option>one</option><option>two</option><option value=x>three</option>
+<option disabled>nope</option></select>
+<p id=p style=\"margin-top:200px\">elsewhere</p>
+<script>window.ev='';var s=document.getElementById('s');
+s.addEventListener('input',function(){window.ev+='i'});
+s.addEventListener('change',function(){window.ev+='c'});</script>")
+
+(defun test-select-open-and-pick ()
+  (format t "~&-- a <select> opens and a click picks from it --~%")
+  (let* ((pg (page +select-page+))
+         (closed-w (r:lbox-w (box-of pg "s"))))
+    (check "the list starts closed" (menu-ink pg "s") 0)
+    (check "the widget shows the first option"
+           (jstr pg "document.getElementById('s').value") "one")
+    (click pg "s")
+    (check "clicking the widget opens the list" (> (menu-ink pg "s") 0) t)
+    (menu-click pg "s" 2)
+    (check "clicking a row picks it" (jstr pg "document.getElementById('s').value") "x")
+    (check "  ... firing input then change, once each" (jstr pg "window.ev") "ic")
+    (check "  ... and the list closes" (menu-ink pg "s") 0)
+    ;; the closed widget is drawn from the label of the option now selected, so a
+    ;; longer one makes a wider box — pixels, not just the IDL
+    (check "the closed widget repaints with the new label"
+           (> (r:lbox-w (box-of pg "s")) closed-w) t)
+    ;; clicking outside dismisses without picking
+    (click pg "s")
+    (check "the list opens again" (> (menu-ink pg "s") 0) t)
+    (click pg "p")
+    (check "a click outside dismisses it" (menu-ink pg "s") 0)
+    (check "  ... and picks nothing" (jstr pg "window.ev") "ic")
+    (check "  ... leaving the value alone" (jstr pg "document.getElementById('s').value") "x")
+    ;; a disabled option is not pickable
+    (click pg "s")
+    (menu-click pg "s" 3)
+    (check "a disabled row does not pick" (jstr pg "document.getElementById('s').value") "x")
+    (check "  ... and leaves the list open" (> (menu-ink pg "s") 0) t)))
+
+(defun test-select-keyboard ()
+  (format t "~&-- and the keyboard drives it too --~%")
+  (let ((pg (page +select-page+)))
+    (click pg "s")                                   ; focus it (this opens the list)
+    (press pg "Escape" 27)
+    (check "Escape closes the list" (menu-ink pg "s") 0)
+    (check "  ... having picked nothing" (jstr pg "window.ev") "")
+    ;; arrows on a CLOSED dropdown move the selection itself
+    (press pg "ArrowDown" 40)
+    (check "ArrowDown on a closed <select> picks the next option"
+           (jstr pg "document.getElementById('s').value") "two")
+    (check "  ... firing input and change" (jstr pg "window.ev") "ic")
+    (press pg "ArrowDown" 40) (press pg "ArrowDown" 40)
+    (check "it stops at the last ENABLED option"
+           (jstr pg "document.getElementById('s').value") "x")
+    ;; Enter opens; arrows then move the HIGHLIGHT, which is not a pick
+    (press pg "Enter" 13)
+    (check "Enter opens the list" (> (menu-ink pg "s") 0) t)
+    (press pg "ArrowUp" 38)
+    (check "an arrow in the open list picks nothing yet"
+           (jstr pg "document.getElementById('s').value") "x")
+    (press pg "Enter" 13)
+    (check "Enter commits the highlighted row"
+           (jstr pg "document.getElementById('s').value") "two")
+    (check "  ... and the list closes" (menu-ink pg "s") 0)))
+
 (defun test-form-round-trip ()
   (format t "~&-- a whole form, filled and submitted --~%")
   (let ((pg (page "<!doctype html><body>
 <form id=f><input id=u type=text size=20 name=user>
 <input id=k type=checkbox name=ok>
+<select id=pick name=plan><option>free</option><option>paid</option></select>
 <input id=s type=submit value=\"Sign in\"></form>
 <script>window.sub=null;document.getElementById('f')
   .addEventListener('submit',function(e){e.preventDefault();
-     window.sub=document.getElementById('u').value+'/'+document.getElementById('k').checked});
+     window.sub=document.getElementById('u').value+'/'+document.getElementById('k').checked
+                +'/'+document.getElementById('pick').value});
 </script>")))
     (click pg "u") (typing pg "ynniv")
     (click pg "k")
+    (click pg "pick") (menu-click pg "pick" 1)
     (click pg "s")
-    (check "submit sees everything the user entered" (jstr pg "window.sub") "ynniv/true")))
+    (check "submit sees everything the user entered" (jstr pg "window.sub") "ynniv/true/paid")))
 
 (defun run ()
   (let ((*pass* 0) (*fail* 0))
@@ -375,6 +470,7 @@ for (var id of ['t','u']) { var e=document.getElementById(id);
                      #'test-focus #'test-typing #'test-change-on-commit
                      #'test-selection #'test-drag-selection
                      #'test-tab-order #'test-tab-commits #'test-textarea-lines
+                     #'test-select-open-and-pick #'test-select-keyboard
                      #'test-readonly-disabled #'test-form-round-trip))
       (handler-case (funcall f)
         (error (e) (incf *fail*) (format t "  FAIL (error) ~a~%" e))))

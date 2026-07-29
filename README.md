@@ -106,7 +106,8 @@ page over VNC, sends a real RFB click on a link with an in-process RFB client, a
 confirms the page navigates and re-renders — no display required.
 `inspect/glass-forms.lisp` does the same for interaction: it serves a form, then
 clicks and types over the wire as real RFB `PointerEvent` / `KeyEvent` messages —
-focus, `.value`, a ticked checkbox and a submit that reads them all back. The
+focus, `.value`, a ticked checkbox, a dropdown opened and picked from, and a
+submit that reads them all back. The
 headless gates drive the page model directly, so only this covers the layer above
 it (chrome offsets, keysym translation, the repaint pump).
 
@@ -119,7 +120,9 @@ it (chrome offsets, keysym translation, the repaint pump).
   the columns crossed, the selection paints, and typing replaces it — and Tab /
   Shift-Tab walk the focusable controls in HTML's order (positive `tabindex`
   first, `disabled` and `tabindex=-1` skipped), selecting the value on the way
-  in. `<select>` dropdowns are still to come.
+  in. A `<select>` opens a real dropdown — painted over the page (it has no
+  layout box), picked with the pointer or the arrow keys, dismissed by Escape or
+  a click outside.
 - CSS `:hover` restyling (recascading on hover) is deferred; JS hover handlers
   (`mouseover` / `mouseout`) and the pointer cursor already work.
 

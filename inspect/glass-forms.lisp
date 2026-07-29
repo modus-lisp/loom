@@ -83,6 +83,37 @@
                (loom.glass::glass-app-chrome-h app)
                (- (loom:page-scroll-y pg)))))))
 
+(defun widget-box (app id)
+  (sb-thread:with-mutex ((loom.glass::glass-app-lock app))
+    (let ((found nil))
+      (labels ((walk (b)
+                 (let ((n (weft.render:lbox-node b)))
+                   (when (and n (eq (weft.html:dnode-kind n) :element)
+                              (equal (cdr (assoc "id" (weft.html:dnode-attrs n) :test #'string-equal)) id))
+                     (setf found b)))
+                 (unless found
+                   (dolist (c (weft.render:lbox-children b))
+                     (when (weft.render::lbox-p c) (walk c))))))
+        (walk (loom:page-root (page-of app))))
+      (or found (error "no box for ~a" id)))))
+
+(defun menu-point (app id row)
+  "RFB desktop coordinates of ROW in ID's open dropdown — from the same geometry
+   the painter used, so this aims at the pixels that are actually there."
+  (let* ((app-lock (loom.glass::glass-app-lock app))
+         (b (widget-box app id)))
+    (sb-thread:with-mutex (app-lock)
+      (let ((pg (page-of app)))
+        (multiple-value-bind (x y w h row-h)
+            (weft.render:select-menu-geometry
+             b (ws:select-labels (weft.render:lbox-node b))
+             (weft.render:canvas-height (loom:page-canvas pg)))
+          (declare (ignore w h))
+          (values (+ x 6)
+                  (+ y 3 (* row row-h)
+                     (loom.glass::glass-app-chrome-h app)
+                     (- (loom:page-scroll-y pg)))))))))
+
 (defun click-at (s x y) (ptr s 0 x y) (ptr s 1 x y) (ptr s 0 x y) (sleep 0.3))
 
 (let* ((port 5972)
@@ -92,13 +123,15 @@
 <body style=\"font: 16px sans-serif; padding: 20px\">
 <form id=f><p>Name: <input id=u type=text size=24 name=user>
 <p><input id=k type=checkbox name=ok> I agree
+<p>Plan: <select id=plan name=plan><option>free</option><option>paid</option></select>
 <p><input id=s type=submit value=\"Sign in\"></form>
 <p id=out>nothing submitted</p>
 <script>document.getElementById('f').addEventListener('submit',function(e){
   e.preventDefault();
   document.getElementById('out').textContent =
     'submitted: ' + document.getElementById('u').value + ' / ' +
-    document.getElementById('k').checked;});</script>" o))
+    document.getElementById('k').checked + ' / ' +
+    document.getElementById('plan').value;});</script>" o))
   (let ((app (loom.glass:run-glass :start path :port port :width 900 :height 640 :background t)))
     (sleep 2)
     (format t "~&=== loom form interaction over real VNC ===~%") (finish-output)
@@ -113,11 +146,17 @@
         ;; tick the checkbox
         (multiple-value-bind (x y) (widget-point app "k") (click-at s x y))
         (check "click ticked the checkbox" (js app "document.getElementById('k').checked") "true")
+        ;; open the dropdown and pick the second row — the popup is painted over
+        ;; the page, so this only works if those pixels really went out on the wire
+        (multiple-value-bind (x y) (widget-point app "plan") (click-at s x y))
+        (multiple-value-bind (x y) (menu-point app "plan" 1) (click-at s x y))
+        (check "picking from the dropdown over RFB" (js app "document.getElementById('plan').value")
+               "paid")
         ;; submit
         (multiple-value-bind (x y) (widget-point app "s") (click-at s x y))
         (sleep 0.5)
         (check "submit saw what was entered" (js app "document.getElementById('out').textContent")
-               "submitted: ynniv / true")
+               "submitted: ynniv / true / paid")
         (ignore-errors (close s)))))
   (format t "~&~%~d passed, ~d failed~%" *pass* *fail*))
 (finish-output)

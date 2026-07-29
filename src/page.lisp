@@ -18,6 +18,8 @@
   (scroll-y 0)
   (press-node nil)                      ; node that received the last mousedown
   (drag-control nil)                    ; text control a press landed in: motion while held extends its selection
+  (open-select nil)                     ; the <select> whose popup is showing (it has no layout box)
+  (menu-index 0)                        ; row the popup's highlight is on
   (hover-node nil)                      ; node currently under the pointer
   (cursor "default")
   (title "loom")
@@ -871,6 +873,9 @@ Returns T when a config was found and applied."
           (page-content-height pg) (r:canvas-height cv)
           (page-scroll-y pg) (clamp-scroll (page-scroll-y pg)
                                             (r:canvas-height cv) (page-viewport-height pg)))
+    ;; An open <select>'s list is drawn LAST, over the finished page: it is the
+    ;; one thing on screen that is above the document rather than in it.
+    (paint-open-menu pg)
     root))
 
 (defun render-page (pg)
@@ -1040,6 +1045,78 @@ Returns T when a config was found and applied."
                         (max 0 (min (r:lbox-h b) (- (+ vy (page-scroll-y pg)) (r:lbox-y b))))
                         painted-caret))))
 
+;;; ---- the <select> popup ----------------------------------------------------
+;;; The open list is chrome, not content: it overlaps whatever is beneath it and
+;;; is gone the moment you pick, so it has no box in the layout tree.  The page
+;;; owns "which select is open" and paints the list over the finished canvas;
+;;; weft.render owns its geometry (it has to line up with the closed widget) and
+;;; weft.script owns what picking a row MEANS.
+
+(defun open-select-menu (pg node)
+  "Show NODE's dropdown, highlighting the option it currently shows."
+  (setf (page-open-select pg) node
+        (page-menu-index pg) (max 0 (ws:select-index (page-ctx pg) node))
+        (ws:context-dirty (page-ctx pg)) t))          ; nothing in the DOM changed; the pixels did
+
+(defun close-select-menu (pg)
+  (when (page-open-select pg)
+    (setf (page-open-select pg) nil
+          (ws:context-dirty (page-ctx pg)) t)
+    t))
+
+(defun paint-open-menu (pg)
+  "Draw the open dropdown onto PG's finished canvas, in page coordinates."
+  (let* ((node (page-open-select pg))
+         (cv (page-canvas pg))
+         (box (and node cv (control-box pg node))))
+    (when box
+      (r:paint-select-menu cv box (ws:select-labels node)
+                           (ws:select-index (page-ctx pg) node)
+                           :highlight (page-menu-index pg)
+                           :max-y (r:canvas-height cv)))))
+
+(defun menu-row-at (pg vx vy)
+  "The popup row under viewport point (VX,VY), or NIL when the point is outside
+   the list — which is how a pick is told from a dismissal."
+  (let* ((node (page-open-select pg))
+         (cv (page-canvas pg))
+         (box (and node cv (control-box pg node))))
+    (when box
+      (r:select-menu-row-at box (ws:select-labels node) vx (+ vy (page-scroll-y pg))
+                            (r:canvas-height cv)))))
+
+(defun menu-row-count (pg)
+  (let ((node (page-open-select pg))) (if node (length (ws:select-labels node)) 0)))
+
+(defun menu-move (pg delta)
+  "Move the popup's highlight DELTA pickable rows, skipping disabled options and
+   stopping at the ends.  The highlight is not a pick: an open menu commits only
+   on Enter or a click."
+  (let* ((node (page-open-select pg))
+         (n (menu-row-count pg))
+         (step (if (minusp delta) -1 1))
+         (j (page-menu-index pg))
+         (k j)
+         (moved 0))
+    (loop while (< moved (abs delta))
+          do (incf k step)
+             (when (or (minusp k) (>= k n)) (return))
+             (when (ws:select-pickable-p node k) (setf j k) (incf moved)))
+    (unless (eql j (page-menu-index pg))
+      (setf (page-menu-index pg) j
+            (ws:context-dirty (page-ctx pg)) t)
+      t)))
+
+(defun menu-commit (pg &optional (row (page-menu-index pg)))
+  "Pick ROW and close the popup.  A disabled row is not a pick and the menu stays
+   open, the way a native menu ignores a click on a greyed item; picking the row
+   already showing closes it without firing anything — nothing changed."
+  (let ((node (page-open-select pg)))
+    (when (and node (ws:select-pickable-p node row))
+      (close-select-menu pg)
+      (ws:pick-option (page-ctx pg) node row)
+      t)))
+
 (defun focus-at (pg node vx vy)
   "Move focus to the control under viewport point (VX,VY), and — when it is a
    text control — put the caret where the pointer landed and arm a drag-select.
@@ -1054,17 +1131,29 @@ Returns T when a config was found and applied."
       (let ((painted (and target (ws:focus-caret ctx target))))
         (ws:commit-edit ctx)
         (ws:set-focus ctx target)
-        (when (and target (ws:text-control-p target))
-          (let ((i (caret-offset-at pg target vx vy painted)))
-            (when i
-              (ws:place-caret ctx target i)
-              (setf (page-drag-control pg) target))))))
+        (cond ((and target (ws:text-control-p target))
+               (let ((i (caret-offset-at pg target vx vy painted)))
+                 (when i
+                   (ws:place-caret ctx target i)
+                   (setf (page-drag-control pg) target))))
+              ;; a click on a closed dropdown opens it
+              ((and target (ws:select-control-p target))
+               (open-select-menu pg target)))))
     target))
 
 (defun mouse-press (pg vx vy &optional (button 0))
   "Route a mouse-button-down at viewport (VX,VY) to a trusted mousedown on
    the hit node, then move focus (a mousedown handler that calls preventDefault
    suppresses the focus change, as in a browser).  Returns the hit node."
+  ;; An open dropdown is above the document, so it gets the press first — and it
+  ;; swallows it either way: clicking a row picks it, clicking anywhere else
+  ;; dismisses the menu and does nothing more, as a native menu does.
+  (when (page-open-select pg)
+    (let ((row (menu-row-at pg vx vy)))
+      (if row (menu-commit pg row) (close-select-menu pg)))
+    (setf (page-press-node pg) nil)
+    (pump pg)
+    (return-from mouse-press nil))
   (let ((n (node-at-page pg vx vy)))
     (setf (page-press-node pg) n)
     (let ((go (if n
@@ -1103,6 +1192,16 @@ Returns T when a config was found and applied."
   "Route pointer motion: a mousemove on the hit node, and — when the hit node
    changes — mouseout on the old node and mouseover on the new one, plus a cursor
    update.  Returns the hit node."
+  ;; An open dropdown is above the document: the pointer moving over it tracks the
+  ;; highlight and the page beneath sees nothing, as under a native menu.
+  (when (page-open-select pg)
+    (let ((row (menu-row-at pg vx vy)))
+      (when (and row (ws:select-pickable-p (page-open-select pg) row)
+                 (/= row (page-menu-index pg)))
+        (setf (page-menu-index pg) row
+              (ws:context-dirty (page-ctx pg)) t)))
+    (pump pg)
+    (return-from mouse-move nil))
   (let ((n (node-at-page pg vx vy)) (ctx (page-ctx pg)) (prev (page-hover-node pg)))
     (when n
       (ws:dispatch-mouse-event ctx n "mousemove" :client-x vx :client-y vy))
@@ -1166,10 +1265,31 @@ Returns T when a config was found and applied."
     (when n
       (when (and (ws:dispatch-keyboard-event ctx n "keydown" :key key :key-code key-code)
                  ctx)
-        (if (string= key "Tab")
-            (tab-to-next pg (not shift))
-            (ws:handle-editing-key ctx key :shift shift))))
+        (cond ((page-open-select pg) (menu-key pg key))
+              ((string= key "Tab") (tab-to-next pg (not shift)))
+              ((ws:select-control-p (ws:active-element ctx))
+               (select-key pg (ws:active-element ctx) key))
+              (t (ws:handle-editing-key ctx key :shift shift)))))
     (pump pg)))
+
+(defun menu-key (pg key)
+  "Keys while a dropdown is open: the arrows move the highlight, Enter picks it,
+   Escape leaves the selection as it was."
+  (cond ((string= key "ArrowDown") (menu-move pg 1))
+        ((string= key "ArrowUp")   (menu-move pg -1))
+        ((string= key "Home")      (menu-move pg (- (menu-row-count pg))))
+        ((string= key "End")       (menu-move pg (menu-row-count pg)))
+        ((or (string= key "Enter") (string= key " ")) (menu-commit pg))
+        ((or (string= key "Escape") (string= key "Tab")) (close-select-menu pg))))
+
+(defun select-key (pg node key)
+  "Keys on a CLOSED dropdown.  The arrows move the selection itself — picking as
+   they go, which is what fires `change' on every step and is what a page
+   listening to a keyboard-driven <select> expects."
+  (let ((ctx (page-ctx pg)))
+    (cond ((string= key "ArrowDown") (ws:select-step ctx node 1))
+          ((string= key "ArrowUp")   (ws:select-step ctx node -1))
+          ((or (string= key "Enter") (string= key " ")) (open-select-menu pg node)))))
 
 (defun key-text (pg text)
   "Dispatch keypress for typed TEXT, then — unless cancelled — insert it at the
