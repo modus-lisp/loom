@@ -115,8 +115,11 @@ it (chrome offsets, keysym translation, the repaint pump).
 - Form controls are interactive: clicking activates them (a checkbox toggles, a
   radio takes its group, a submit button submits), clicking focuses and places
   the caret, and typing edits the value with `input`/`change` fired where HTML
-  says. Selection (shift-arrows, drag), `<select>` dropdowns and tab-order
-  traversal are still to come.
+  says. Text is selectable — shift-arrows extend, dragging the pointer selects
+  the columns crossed, the selection paints, and typing replaces it — and Tab /
+  Shift-Tab walk the focusable controls in HTML's order (positive `tabindex`
+  first, `disabled` and `tabindex=-1` skipped), selecting the value on the way
+  in. `<select>` dropdowns are still to come.
 - CSS `:hover` restyling (recascading on hover) is deferred; JS hover handlers
   (`mouseover` / `mouseout`) and the pointer cursor already work.
 

@@ -38,6 +38,7 @@
   (dirty t)
   (running t)                           ; pump-loop keeps going while true
   (buttons 0)                           ; last RFB button mask (low 3 bits)
+  (shift nil)                           ; Shift held?  RFB has no modifier mask — it sends Shift as an ordinary key down/up, so we latch it
   ;; scroll-triggered lazy image loading (see MAYBE-WARM-LAZY):
   (warmed (make-hash-table :test 'equal)) ; lazy img URLs already warm-attempted (no re-warm)
   (warming nil)                         ; T while a background warm+re-render is in flight
@@ -359,19 +360,27 @@
            (glass-app-edit-sel app) nil
            (glass-app-dirty app) t))))
 
+(defparameter +shift-keysyms+ '(#xffe1 #xffe2)
+  "Shift_L / Shift_R.  A modifier arrives as its own key event, never as a flag
+   on the keystroke it modifies, so shift-selection depends on latching it.")
+
 (defun on-key (app down keysym)
-  (when down
-    (sb-thread:with-mutex ((glass-app-lock app))
-      (if (glass-app-editing app)
-          (edit-key app keysym)
-          (let ((pg (glass-app-page app)))
-            (cond
-              ((<= 32 keysym 126)                          ; printable: keydown + textinput
-               (let ((s (string (code-char keysym))))
-                 (loom:key-down pg s :key-code keysym)
-                 (loom:key-text pg s)))
-              (t (loom:key-down pg (keysym-name keysym) :key-code keysym)))
-            (setf (glass-app-dirty app) t))))))
+  (sb-thread:with-mutex ((glass-app-lock app))
+    (cond
+      ((member keysym +shift-keysyms+)
+       (setf (glass-app-shift app) (and down t)))
+      ((not down))                                     ; key-up: nothing else acts on it
+      ((glass-app-editing app) (edit-key app keysym))
+      (t
+       (let ((pg (glass-app-page app))
+             (shift (glass-app-shift app)))
+         (cond
+           ((<= 32 keysym 126)                         ; printable: keydown + textinput
+            (let ((s (string (code-char keysym))))
+              (loom:key-down pg s :key-code keysym :shift shift)
+              (loom:key-text pg s)))
+           (t (loom:key-down pg (keysym-name keysym) :key-code keysym :shift shift)))
+         (setf (glass-app-dirty app) t))))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Scroll-triggered lazy image loading

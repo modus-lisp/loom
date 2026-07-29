@@ -70,8 +70,26 @@
         do (loom:key-down pg (string c) :key-code (char-code c))
            (loom:key-text pg (string c))))
 
-(defun press (pg key &optional code)
-  (loom:key-down pg key :key-code code))
+(defun press (pg key &optional code shift)
+  (loom:key-down pg key :key-code code :shift shift))
+
+(defun col-x (pg id col)
+  "The x of text column COL inside ID's widget — the 4px inset the painters use."
+  (+ (round (r:lbox-x (or (box-of pg id) (error "no box for ~a" id))))
+     4 (* col r::*font-w*)))
+
+(defun drag (pg id from-col to-col &key (dy 6))
+  "Press at text column FROM-COL, move to TO-COL with the button held, release."
+  (let ((y (+ (round (r:lbox-y (box-of pg id))) dy)))
+    (loom:mouse-press pg (col-x pg id from-col) y 0)
+    (loom:mouse-move pg (col-x pg id to-col) y)
+    (loom:mouse-release pg (col-x pg id to-col) y 0)))
+
+(defun sel (pg id)
+  "ID's selection as \"start-end\", read through the IDL — the same numbers the
+   caret is painted from, which is the point of asserting on them here."
+  (jstr pg (format nil "(function(e){return e.selectionStart+'-'+e.selectionEnd})~
+                        (document.getElementById('~a'))" id)))
 
 (defun page (html &key (width 600))
   (let ((pg (loom:load-page html :url "about:forms-interact" :width width)))
@@ -224,6 +242,116 @@ for (var id of ['t','u']) { var e=document.getElementById(id);
     (click pg "x")
     (check "disabled checkbox rejects clicks" (jbool pg "document.getElementById('x').checked") nil)))
 
+;;; ---- 5. selection ----------------------------------------------------------
+;;; The caret and `input.selectionStart' are ONE selection.  Every assertion here
+;;; reads the IDL after driving the keyboard/pointer, so a shell that kept its
+;;; own private caret would fail on the first one.
+(defun test-selection ()
+  (format t "~&-- shift-arrows and drags select text --~%")
+  (let ((pg (page "<!doctype html><body><input id=t type=text size=20 value=\"hello world\">")))
+    (click pg "t") (press pg "Home" 36)
+    (check "Home collapses at the start" (sel pg "t") "0-0")
+    (loom:render-page pg)
+    (let ((caret-only (ink-in pg "t")))       ; same text, same caret, no highlight
+      (dotimes (i 5) (press pg "ArrowRight" 39 t))
+      (check "shift-ArrowRight extends the selection" (sel pg "t") "0-5")
+      (loom:render-page pg)
+      (check "the highlight is painted" (> (ink-in pg "t") caret-only) t))
+    ;; typing replaces what is selected — the whole reason a selection exists
+    (typing pg "HELLO")
+    (check "typing replaces the selection"
+           (jstr pg "document.getElementById('t').value") "HELLO world")
+    (check "  ... and leaves the caret after it" (sel pg "t") "5-5")
+    ;; a plain arrow collapses rather than stepping from the moving edge
+    (press pg "Home" 36)
+    (dotimes (i 3) (press pg "ArrowRight" 39 t))
+    (press pg "ArrowLeft" 37)
+    (check "a plain arrow collapses the selection to its near edge" (sel pg "t") "0-0")
+    ;; Backspace over a selection removes the selection, not one more character
+    (press pg "End" 35)
+    (dotimes (i 6) (press pg "ArrowLeft" 37 t))
+    (check "shift-ArrowLeft selects backwards" (sel pg "t") "5-11")
+    (press pg "Backspace" 8)
+    (check "Backspace deletes the selection whole"
+           (jstr pg "document.getElementById('t').value") "HELLO")
+    ;; select() from script, then type over it
+    (js pg "document.getElementById('t').select()")
+    (check "select() selects the value" (sel pg "t") "0-5")
+    (typing pg "x")
+    (check "typing replaces a script-made selection"
+           (jstr pg "document.getElementById('t').value") "x")))
+
+(defun test-drag-selection ()
+  (format t "~&-- dragging the pointer selects --~%")
+  (let ((pg (page "<!doctype html><body><input id=t type=text size=20 value=\"drag over me\">")))
+    (drag pg "t" 0 4)
+    (check "drag selects the columns crossed" (sel pg "t") "0-4")
+    (check "  ... and focus went to the field" (jstr pg "document.activeElement.id") "t")
+    (drag pg "t" 9 5)
+    (check "dragging leftwards selects backwards too" (sel pg "t") "5-9")
+    (typing pg "X")
+    (check "typing replaces the dragged selection"
+           (jstr pg "document.getElementById('t').value") "drag X me")
+    ;; a plain click collapses it again
+    (click pg "t" :dx 4 :dy 6)
+    (check "a click collapses the selection" (sel pg "t") "0-0")))
+
+;;; ---- 6. tab order ----------------------------------------------------------
+(defun test-tab-order ()
+  (format t "~&-- Tab walks the focusable controls --~%")
+  (let ((pg (page "<!doctype html><body>
+<input id=a type=text size=8><input id=skip type=text size=8 disabled>
+<input id=neg type=text size=8 tabindex=-1><input id=b type=text size=8>
+<button id=c>go</button><a id=lnk href=\"#x\">link</a>
+<input id=first type=text size=8 tabindex=1>")))
+    ;; a positive tabindex comes FIRST, whatever the tree order
+    (press pg "Tab" 9)
+    (check "Tab from nowhere honours tabindex=1" (jstr pg "document.activeElement.id") "first")
+    (press pg "Tab" 9)
+    (check "then the first control in tree order" (jstr pg "document.activeElement.id") "a")
+    (press pg "Tab" 9)
+    (check "disabled and tabindex=-1 are skipped" (jstr pg "document.activeElement.id") "b")
+    (press pg "Tab" 9)
+    (check "a <button> is in the order" (jstr pg "document.activeElement.id") "c")
+    (press pg "Tab" 9)
+    (check "so is a link with an href" (jstr pg "document.activeElement.id") "lnk")
+    (press pg "Tab" 9 t)
+    (check "Shift-Tab goes back" (jstr pg "document.activeElement.id") "c")
+    ;; Tabbing INTO a field selects its value, so the next keystroke replaces it
+    (js pg "document.getElementById('b').value='replace me'")
+    (press pg "Tab" 9 t)
+    (check "Shift-Tab again reaches the field" (jstr pg "document.activeElement.id") "b")
+    (check "tabbing in selects the value" (sel pg "b") "0-10")
+    (typing pg "new")
+    (check "so typing replaces it" (jstr pg "document.getElementById('b').value") "new")))
+
+(defun test-tab-commits ()
+  (format t "~&-- Tab away commits the edit --~%")
+  (let ((pg (page "<!doctype html><body><input id=t type=text size=8><input id=u type=text size=8>
+<script>window.ch=0;document.getElementById('t')
+  .addEventListener('change',function(){window.ch++});</script>")))
+    (click pg "t") (typing pg "abc")
+    (check "no change while typing" (jstr pg "String(window.ch)") "0")
+    (press pg "Tab" 9)
+    (check "Tab moves focus" (jstr pg "document.activeElement.id") "u")
+    (check "  ... and fires change on the way out" (jstr pg "String(window.ch)") "1")))
+
+(defun test-textarea-lines ()
+  (format t "~&-- a textarea is multi-line --~%")
+  (let ((pg (page "<!doctype html><body><textarea id=a rows=4 cols=20></textarea>")))
+    (click pg "a")
+    (typing pg "one") (press pg "Enter" 13) (typing pg "two")
+    (check "Enter inserts a newline" (jstr pg "document.getElementById('a').value")
+           (format nil "one~atwo" #\Newline))
+    (press pg "ArrowUp" 38)
+    (check "ArrowUp keeps the column on the line above" (sel pg "a") "3-3")
+    (press pg "Home" 36)
+    (check "Home goes to the LINE start, not the value start" (sel pg "a") "0-0")
+    (press pg "End" 35)
+    (check "End goes to the line end" (sel pg "a") "3-3")
+    (press pg "ArrowDown" 40)
+    (check "ArrowDown comes back" (sel pg "a") "7-7")))
+
 (defun test-form-round-trip ()
   (format t "~&-- a whole form, filled and submitted --~%")
   (let ((pg (page "<!doctype html><body>
@@ -245,6 +373,8 @@ for (var id of ['t','u']) { var e=document.getElementById(id);
     (dolist (f (list #'test-live-value-painted #'test-live-checked-painted
                      #'test-click-activation #'test-click-events
                      #'test-focus #'test-typing #'test-change-on-commit
+                     #'test-selection #'test-drag-selection
+                     #'test-tab-order #'test-tab-commits #'test-textarea-lines
                      #'test-readonly-disabled #'test-form-round-trip))
       (handler-case (funcall f)
         (error (e) (incf *fail*) (format t "  FAIL (error) ~a~%" e))))

@@ -17,6 +17,7 @@
   (content-height 0)
   (scroll-y 0)
   (press-node nil)                      ; node that received the last mousedown
+  (drag-control nil)                    ; text control a press landed in: motion while held extends its selection
   (hover-node nil)                      ; node currently under the pointer
   (cursor "default")
   (title "loom")
@@ -1017,23 +1018,47 @@ Returns T when a config was found and applied."
         when (and (eq (h:dnode-kind n) :element) (r:form-control-focusable-p n))
           do (return n)))
 
+(defun control-box (pg node)
+  "NODE's layout box, found by identity rather than by hit-testing a point — a
+   drag can leave the widget, and the box is still the one being selected in."
+  (labels ((walk (b)
+             (if (eq (r:lbox-node b) node)
+                 b
+                 (some #'walk (remove-if-not #'r::lbox-p (r:lbox-children b))))))
+    (let ((root (page-root pg))) (and root (walk root)))))
+
+(defun caret-offset-at (pg node vx vy &optional painted-caret)
+  "The offset in NODE's value that viewport point (VX,VY) points at, CLAMPED to
+   NODE's widget box so a drag running off the end keeps selecting to the end
+   instead of stopping dead at the border.  PAINTED-CARET is the caret the box
+   was last DRAWN with — an overflowing field scrolls to its caret, so the
+   column only means something against the scroll it was painted at."
+  (let ((b (control-box pg node)) (ctx (page-ctx pg)))
+    (when (and b ctx)
+      (r:caret-index-at node (ws:control-value ctx node) (r:lbox-w b)
+                        (max 0 (min (r:lbox-w b) (- vx (r:lbox-x b))))
+                        (max 0 (min (r:lbox-h b) (- (+ vy (page-scroll-y pg)) (r:lbox-y b))))
+                        painted-caret))))
+
 (defun focus-at (pg node vx vy)
   "Move focus to the control under viewport point (VX,VY), and — when it is a
-   text control — put the caret where the pointer landed.  Commits any pending
-   edit first: HTML fires `change' before the `blur' that caused it."
+   text control — put the caret where the pointer landed and arm a drag-select.
+   Commits any pending edit first: HTML fires `change' before the `blur' that
+   caused it."
   (let* ((ctx (page-ctx pg))
          (target (and node (focusable-ancestor node))))
+    (setf (page-drag-control pg) nil)
     (when ctx
-      (ws:commit-edit ctx)
-      (ws:set-focus ctx target)
-      (when (and target (ws:text-control-p target))
-        (let ((b (r:box-at (page-root pg) vx (+ vy (page-scroll-y pg)))))
-          (when (and b (eq (r:lbox-node b) target))
-            (ws:place-caret ctx target
-                            (r:caret-index-at target (ws:control-value ctx target)
-                                              (r:lbox-w b)
-                                              (- vx (r:lbox-x b))
-                                              (- (+ vy (page-scroll-y pg)) (r:lbox-y b))))))))
+      ;; Read the caret BEFORE the focus change: it is the one the pixels the
+      ;; user just clicked were painted with.
+      (let ((painted (and target (ws:focus-caret ctx target))))
+        (ws:commit-edit ctx)
+        (ws:set-focus ctx target)
+        (when (and target (ws:text-control-p target))
+          (let ((i (caret-offset-at pg target vx vy painted)))
+            (when i
+              (ws:place-caret ctx target i)
+              (setf (page-drag-control pg) target))))))
     target))
 
 (defun mouse-press (pg vx vy &optional (button 0))
@@ -1062,7 +1087,8 @@ Returns T when a config was found and applied."
       (let ((go (ws:dispatch-mouse-event ctx n "click"
                                          :button button :client-x vx :client-y vy :detail 1)))
         (when (and go (zerop button)) (maybe-follow-link pg n))))
-    (setf (page-press-node pg) nil)
+    (setf (page-press-node pg) nil
+          (page-drag-control pg) nil)
     (pump pg)
     n))
 
@@ -1080,6 +1106,13 @@ Returns T when a config was found and applied."
   (let ((n (node-at-page pg vx vy)) (ctx (page-ctx pg)) (prev (page-hover-node pg)))
     (when n
       (ws:dispatch-mouse-event ctx n "mousemove" :client-x vx :client-y vy))
+    ;; A press that landed in a text control turns motion into a drag-select
+    ;; until the button comes up.  PRESS-NODE is the button-is-down flag: the
+    ;; shell reports motion whether or not anything is held.
+    (let ((dc (page-drag-control pg)))
+      (when (and dc (page-press-node pg) ctx)
+        (let ((i (caret-offset-at pg dc vx vy (ws:focus-caret ctx dc))))
+          (when i (ws:extend-selection-to ctx dc i)))))
     (unless (eq n prev)
       (when prev (ws:dispatch-mouse-event ctx prev "mouseout" :client-x vx :client-y vy))
       (when n (ws:dispatch-mouse-event ctx n "mouseover" :client-x vx :client-y vy))
@@ -1112,15 +1145,30 @@ Returns T when a config was found and applied."
              (css:query-select doc "html")
              doc))))
 
-(defun key-down (pg key &key key-code)
+(defun tab-to-next (pg forward)
+  "Move focus one step along the document's tab order, committing any pending
+   edit first (the blur is what fires `change'), and select the value of the
+   control that receives it — what a browser does when you Tab into a field,
+   and what makes the next keystroke replace rather than append."
+  (let ((ctx (page-ctx pg)))
+    (when ctx
+      (ws:commit-edit ctx)
+      (let ((got (ws:focus-navigate ctx forward)))
+        (when got (ws:select-all ctx got))
+        got))))
+
+(defun key-down (pg key &key key-code shift)
   "Dispatch a trusted keydown for DOM key string KEY (\"a\", \"Enter\", …), then
-   — unless a handler cancelled it — run the key's default action in the focused
-   text control (caret motion, Backspace/Delete, Enter)."
+   — unless a handler cancelled it — run the key's default action: Tab moves
+   focus along the tab order, everything else edits the focused text control
+   (caret motion, selection with SHIFT held, Backspace/Delete, Enter)."
   (let ((ctx (page-ctx pg)) (n (key-target pg)))
     (when n
       (when (and (ws:dispatch-keyboard-event ctx n "keydown" :key key :key-code key-code)
                  ctx)
-        (ws:handle-editing-key ctx key)))
+        (if (string= key "Tab")
+            (tab-to-next pg (not shift))
+            (ws:handle-editing-key ctx key :shift shift))))
     (pump pg)))
 
 (defun key-text (pg text)
