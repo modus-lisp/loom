@@ -13,7 +13,9 @@
   (:use #:cl)
   (:local-nicknames (#:r #:weft.render) (#:ui #:loom.ui))
   (:export #:serve #:run-glass #:attach #:attach-browser #:pump-loop #:on-key #:on-pointer #:stop
-           #:glass-app #:glass-app-page #:glass-app-fb))
+           #:glass-app #:glass-app-page #:glass-app-fb
+           ;; per-frame paint counters (see scroll-perf.lisp) — OFF by default
+           #:*scroll-perf* #:scroll-perf-reset #:scroll-perf-report))
 (in-package #:loom.glass)
 
 (defstruct nav-node

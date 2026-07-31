@@ -71,7 +71,11 @@
          (ch-h (glass-app-chrome-h app))
          (page-h (- fbh ch-h))
          (sy (if pg (min (loom:page-scroll-y pg) (max 0 (- ch page-h))) 0))
-         (cols (min cw fbw)))
+         (cols (min cw fbw))
+         ;; scroll-perf (OFF by default): one clock pair around the whole blit, and
+         ;; one around the chrome, so the two can be told apart.  See scroll-perf.lisp.
+         (t0 (and *scroll-perf* (get-internal-real-time)))
+         (ct 0))
     (glass:with-fb-locked (fb)
       (dotimes (y page-h)
         (let ((cy (+ sy y))
@@ -87,7 +91,22 @@
                                  (aref px (+ o 2))))))
                (loop for x from cols below fbw do (setf (aref fbpx (+ drow x)) #xffffff))))
             (t (loop for x from 0 below fbw do (setf (aref fbpx (+ drow x)) #xffffff))))))
-      (when (plusp ch-h) (render-chrome app)))))
+      (when (plusp ch-h)
+        (if t0
+            (let ((c0 (get-internal-real-time)))
+              (render-chrome app)
+              (setf ct (- (get-internal-real-time) c0)))
+            (render-chrome app)))
+      ;; Tell glass what this paint changed.  PAINT writes the pixel array directly
+      ;; (not through fb-put/fb-rect, which touch), so without this the fb generation
+      ;; never moves and the RFB sender parks: a bare page served by SERVE froze after
+      ;; its first frame.  The mark is a BOX rather than :FULL because glass only
+      ;; honours a CopyRect hint alongside a real damage box — the seam a scroll-aware
+      ;; path needs.  (Under the WM, loom's fb is a surface the compositor re-reads
+      ;; anyway; the mark is free there and lets a future dirty-p poll the generation.)
+      (glass:fb-mark-frame fb (list 0 0 fbw fbh))
+      (glass:fb-touch fb))
+    (when t0 (note-paint (- (get-internal-real-time) t0) ct sy cv))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Browser chrome — breadcrumb spine + branch rail, drawn with the widget kit.
@@ -307,8 +326,8 @@
            (when pg                                        ; a loading node has no page yet
              (let* ((py (- y ch-h)) (real (logand mask 7))
                     (changed (logxor real (glass-app-buttons app))))
-               (when (logtest mask 8)  (loom:mouse-wheel pg 1))
-               (when (logtest mask 16) (loom:mouse-wheel pg -1))
+               (when (logtest mask 8)  (note-wheel 1) (loom:mouse-wheel pg 1))
+               (when (logtest mask 16) (note-wheel 1) (loom:mouse-wheel pg -1))
                (loom:mouse-move pg x py)
                (dotimes (b 3)
                  (when (logbitp b changed)
@@ -455,6 +474,7 @@
            ;; off the lock: notice new lazy images the scroll brought into view and
            ;; warm+re-render them in the background (non-blocking — see MAYBE-WARM-LAZY).
            (maybe-warm-lazy app)
+           (note-pump)
            (incf i)
            (unless max-iterations (sleep 1/60))))
 

@@ -32,6 +32,7 @@
   :components ((:module "src" :serial t
                 :components ((:file "ui")            ; immediate-mode widget kit over glass
                              (:file "nav")           ; navigation tree (nodes / cursor / branching)
+                             (:file "scroll-perf")   ; per-frame paint counters (flag-gated, off)
                              (:file "glass-shell"))))) ; the browser shell (chrome + input + pump)
 
 (defsystem "loom/test"
