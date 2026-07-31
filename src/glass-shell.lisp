@@ -43,7 +43,17 @@
   (warmed (make-hash-table :test 'equal)) ; lazy img URLs already warm-attempted (no re-warm)
   (warming nil)                         ; T while a background warm+re-render is in flight
   (last-scroll -1)                      ; page-scroll-y at the last lazy check (skip if unmoved)
-  (last-lazy-check 0))                  ; internal-real-time of the last check (throttle to a few/sec)
+  (last-lazy-check 0)                   ; internal-real-time of the last check (throttle to a few/sec)
+  ;; --- what the PREVIOUS paint left in the framebuffer (see SCROLL-COPY-HINT) ---
+  ;; A frame that differs from its predecessor only by a scroll offset is a pure
+  ;; translation of the pixels already on screen, which is a CopyRect; these are the
+  ;; things that must be unchanged for that to be true.
+  (paint-canvas nil)                    ; canvas object the last paint sliced (NIL = none yet)
+  (paint-scroll nil)                    ; scroll offset it landed at (NIL = none yet)
+  (paint-fbw -1) (paint-fbh -1)         ; framebuffer size it was painted into
+  (paint-chrome -1)                     ; chrome height it was painted under
+  ;; --- chrome repaint gate (see CHROME-SIGNATURE) ---
+  (chrome-sig nil))                     ; signature of the state the drawn chrome came from
 
 (defun stop (app)
   "Stop APP's pump loop (e.g. when its host window is closed) so weft stops
@@ -53,6 +63,85 @@
 ;;; ---------------------------------------------------------------------------
 ;;; Paint — weft's RGB8 canvas slice -> the glass framebuffer
 ;;; ---------------------------------------------------------------------------
+(defparameter *scroll-copyrect* t
+  "Whether PAINT hands glass a CopyRect hint when a frame is a pure scroll.  A scroll
+   re-blits the whole screen, but the pixels it writes are (except for one newly exposed
+   strip) the pixels the client ALREADY HAS, translated — which is precisely what RFB's
+   CopyRect says in twelve bytes.  Without the hint glass has no way to know that and
+   re-encodes all of it: measured at 1280x800, 780 KB and ~29 ms a frame against 82 KB
+   and ~4 ms.  Live-tunable; NIL restores the whole-screen re-encode.")
+
+(defun scroll-copy-hint (app cv fbw fbh ch-h sy)
+  "The CopyRect hint (src-x src-y dst-x dst-y w h) for the paint that just wrote SY's
+   slice, or NIL when this frame was not a pure scroll of the previous one.  Records
+   this paint's identity for the next call either way.
+
+   Pure means: the same canvas, at the same size, under the same chrome, at a different
+   offset — so the page area is the previous page area translated by -(SY delta) rows,
+   with one strip of new content at the leading edge.  A re-render (new canvas), a
+   resize, or the first paint after either has nothing to translate.  The chrome is NOT
+   part of the copy; it sits above the copied block and rides the ordinary diff.
+
+   NIL is always the safe answer: the hint only ever saves the sender work, and glass
+   applies the same translation to the client's snapshot before diffing, so anything the
+   copy does not carry is found and sent as usual."
+  (let ((page-h (- fbh ch-h))
+        (prev (glass-app-paint-scroll app)))
+    (prog1
+        (when (and *scroll-copyrect* cv prev
+                   (eq cv (glass-app-paint-canvas app))
+                   (= fbw (glass-app-paint-fbw app)) (= fbh (glass-app-paint-fbh app))
+                   (= ch-h (glass-app-paint-chrome app))
+                   (/= sy prev) (< (abs (- sy prev)) page-h))
+          (let ((d (- sy prev)))
+            (if (plusp d)
+                ;; scrolled DOWN: the block below the exposed strip moved UP by D
+                (list 0 (+ ch-h d) 0 ch-h        fbw (- page-h d))
+                ;; scrolled UP: the block above the exposed strip moved DOWN by -D
+                (list 0 ch-h       0 (- ch-h d)  fbw (+ page-h d)))))
+      (setf (glass-app-paint-canvas app) cv
+            (glass-app-paint-scroll app) sy
+            (glass-app-paint-fbw app) fbw
+            (glass-app-paint-fbh app) fbh
+            (glass-app-paint-chrome app) ch-h))))
+
+(defun blit-slice (px cw ch fbpx fbw fbh sy ch-h)
+  "Copy the page canvas rows SY.. into framebuffer rows CH-H.., packing weft's
+   row-major RGB8 triples into glass's 0x00RRGGBB words; rows (or columns) past the
+   canvas are white.  PX may be NIL — a node that is still loading has no canvas yet,
+   and the whole page area goes white.
+
+   This is the loop the frame rate is made of: one iteration per visible pixel, ~1M of
+   them at 1280x800, so it is declared.  Without the declarations SBCL boxes the array
+   references generically and the same copy costs 4-5x as much (measured 26 ms against
+   6) — which is most of a frame budget spent on type dispatch, not on memory."
+  (declare (type (or null (simple-array (unsigned-byte 8) (*))) px)
+           (type (simple-array (unsigned-byte 32) (*)) fbpx)
+           (type fixnum cw ch fbw fbh sy ch-h)
+           (optimize (speed 3) (safety 0)))
+  (let ((page-h (- fbh ch-h))
+        (cols (min cw fbw)))
+    (declare (fixnum page-h cols))
+    (dotimes (y page-h)
+      (declare (fixnum y))
+      (let ((cy (+ sy y))
+            (drow (* (+ y ch-h) fbw)))                 ; page starts CH-H rows down
+        (declare (fixnum cy drow))
+        (cond
+          ((and px (< cy ch))
+           (let ((srow (* cy cw 3)))
+             (declare (fixnum srow))
+             (dotimes (x cols)
+               (declare (fixnum x))
+               (let ((o (+ srow (* x 3))))
+                 (declare (fixnum o))
+                 (setf (aref fbpx (+ drow x))
+                       (logior (ash (aref px o) 16)
+                               (ash (aref px (+ o 1)) 8)
+                               (aref px (+ o 2))))))
+             (loop for x fixnum from cols below fbw do (setf (aref fbpx (+ drow x)) #xffffff))))
+          (t (loop for x fixnum from 0 below fbw do (setf (aref fbpx (+ drow x)) #xffffff))))))))
+
 (defun paint (app)
   "Copy the visible slice of the page canvas (at the current scroll offset) into
    the glass framebuffer, packing RGB8 -> 0x00RRGGBB.  The page occupies the rows
@@ -71,27 +160,17 @@
          (ch-h (glass-app-chrome-h app))
          (page-h (- fbh ch-h))
          (sy (if pg (min (loom:page-scroll-y pg) (max 0 (- ch page-h))) 0))
-         (cols (min cw fbw))
          ;; scroll-perf (OFF by default): one clock pair around the whole blit, and
          ;; one around the chrome, so the two can be told apart.  See scroll-perf.lisp.
          (t0 (and *scroll-perf* (get-internal-real-time)))
          (ct 0))
     (glass:with-fb-locked (fb)
-      (dotimes (y page-h)
-        (let ((cy (+ sy y))
-              (drow (* (+ y ch-h) fbw)))            ; page starts CH-H rows down
-          (cond
-            ((and px (< cy ch))
-             (let ((srow (* cy cw 3)))
-               (dotimes (x cols)
-                 (let ((o (+ srow (* x 3))))
-                   (setf (aref fbpx (+ drow x))
-                         (logior (ash (aref px o) 16)
-                                 (ash (aref px (+ o 1)) 8)
-                                 (aref px (+ o 2))))))
-               (loop for x from cols below fbw do (setf (aref fbpx (+ drow x)) #xffffff))))
-            (t (loop for x from 0 below fbw do (setf (aref fbpx (+ drow x)) #xffffff))))))
-      (when (plusp ch-h)
+      (blit-slice px cw ch fbpx fbw fbh sy ch-h)
+      ;; The chrome sits ABOVE the blit, so its pixels survive a paint untouched — and
+      ;; redrawing it costs about as much as a sixth of the blit.  Draw it only when the
+      ;; state it is a picture of has actually moved (CHROME-SIGNATURE), which during a
+      ;; scroll is never.
+      (when (and (plusp ch-h) (chrome-changed-p app))
         (if t0
             (let ((c0 (get-internal-real-time)))
               (render-chrome app)
@@ -101,10 +180,12 @@
       ;; (not through fb-put/fb-rect, which touch), so without this the fb generation
       ;; never moves and the RFB sender parks: a bare page served by SERVE froze after
       ;; its first frame.  The mark is a BOX rather than :FULL because glass only
-      ;; honours a CopyRect hint alongside a real damage box — the seam a scroll-aware
-      ;; path needs.  (Under the WM, loom's fb is a surface the compositor re-reads
-      ;; anyway; the mark is free there and lets a future dirty-p poll the generation.)
-      (glass:fb-mark-frame fb (list 0 0 fbw fbh))
+      ;; honours a CopyRect hint alongside a real damage box — and when this frame was a
+      ;; pure scroll we hand it that hint, so the moved pixels go out as a CopyRect and
+      ;; only the newly exposed strip is encoded.  (Under the WM, loom's fb is a surface
+      ;; the compositor re-reads anyway; the mark is free there and drives its dirty-p.)
+      (glass:fb-mark-frame fb (list 0 0 fbw fbh)
+                           (scroll-copy-hint app cv fbw fbh ch-h sy))
       (glass:fb-touch fb))
     (when t0 (note-paint (- (get-internal-real-time) t0) ct sy cv))))
 
@@ -124,6 +205,36 @@
 (defun any-loading-p (app)
   "Is the cursor (the visible node) still loading?  Drives the spinner/progress."
   (let ((c (glass-app-cursor app))) (and c (nav-node-loading c))))
+
+(defun chrome-signature (app)
+  "Everything the drawn chrome is a picture of, in one EQUAL-comparable value.
+
+   Deriving the gate from the INPUTS rather than from a flag set by hand is what keeps
+   it honest: the chrome is a pure function of these, so anything that changes the
+   picture necessarily changes the signature — including the ones a hand-maintained
+   flag forgets, like a background load filling in a SIBLING branch's title.  Building
+   it is a few conses over a handful of nodes; drawing the chrome is ~4 ms."
+  (let* ((cursor (glass-app-cursor app))
+         (loading (any-loading-p app)))
+    (list (glass:fb-width (glass-app-fb app))                    ; a resize clears the fb, so
+          (glass:fb-height (glass-app-fb app))                   ; both dimensions force a redraw
+          (glass-app-px app) (glass-app-py app)                  ; hover
+          (glass-app-editing app) (glass-app-edit-buf app) (glass-app-edit-sel app)
+          cursor (and cursor (nav-node-parent cursor))           ; Back enabled?
+          loading
+          (and loading (glass-app-anim app))                     ; spinner phase — only while it turns
+          ;; every node with a crumb or a chip, and the fields its label reads
+          (loop for n in (and cursor (append (nav-path cursor) (nav-siblings cursor)
+                                             (nav-children cursor)))
+                collect (list n (nav-node-loading n) (nav-node-title n) (nav-node-url n))))))
+
+(defun chrome-changed-p (app)
+  "Has anything the chrome draws from moved since the chrome was last drawn?  Records
+   the new signature, so a T is consumed by the caller that redraws."
+  (let ((sig (chrome-signature app)))
+    (unless (equal sig (glass-app-chrome-sig app))
+      (setf (glass-app-chrome-sig app) sig)
+      t)))
 
 (defun render-chrome (app)
   "Draw the breadcrumb+rail chrome via the kit and stash the frame's hit-list on
