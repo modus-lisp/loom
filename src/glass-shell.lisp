@@ -373,33 +373,61 @@
             (when (nav-node-page node) (wire-navigation app)))
           (setf (glass-app-dirty app) t))))))
 
-(defun publish-selection (app text)
-  "Put TEXT on the session clipboard with APP — this browser window — as the owner.
+(defvar *copy-on-select* t
+  "Does finishing a selection also COPY it to the session clipboard?
 
-   Selecting IS copying — the X11 PRIMARY convention — so there is no copy key and
-   no copy button, which matters because the touch client has neither: its
-   press-and-hold-to-grab produces a press, a drag and a release and nothing else.
-   The clipboard notifies on its own, so every connected RFB viewer receives a
-   ServerCutText with this string within one sender tick, and any desktop app that
-   asks (say, to speak it) sees the same value.
+   T is the X11 PRIMARY convention and the default, because it is what makes copy-out
+   work at all here: there is no copy key and no copy button, and the touch client has
+   neither — its press-and-hold-to-grab produces a press, a drag and a release and
+   nothing else.  With this on, letting go of a selection is the copy gesture, and
+   every connected RFB viewer gets a ServerCutText it can paste from.
+
+   NIL is for the session that would rather keep its clipboard: selecting then leaves
+   the highlight alone and touches nothing, so whatever was copied earlier survives
+   reading a page.  The cost is that there is then NO way to copy out of loom on a
+   client with no keyboard — that is the whole of the tradeoff.
+
+   Either way the LIVE selection is unaffected: the highlight is the page's own state
+   and SELECTION-TEXT reads it directly, so a context menu over the words still has
+   them to act on with this off.  Set it over the desktop's control socket; there is
+   deliberately no UI, because this is a preference about the session, not a mode the
+   hand should be able to flip mid-gesture.")
+
+(defun publish-selection (app text)
+  "Put TEXT on the session clipboard with APP — this browser window — as the owner,
+   if *COPY-ON-SELECT* says selecting is copying.
 
    The owner is the APP OBJECT and not a bare :LOOM, because X11's owner is a
    WINDOW: it answers \"which one of you is holding the selection right now?\", and
-   two browser windows are two answers.  Anything that wants to act on the selection
-   where it lives — a context menu over the text, say — needs that distinction, and
-   the display name stays \"loom\" so a clipboard report reads the same as before.
+   two browser windows are two answers — and the display name stays \"loom\" so a
+   clipboard report reads the same as before.
 
    The desktop is one session and this is its one clipboard, so a failure here must
    not take the browser down with it — a selection is still a selection even if
    nobody is listening."
-  (when (and text (plusp (length text)))
+  (when (and *copy-on-select* text (plusp (length text)))
     (ignore-errors
      (glass:clipboard-set (glass:session-clipboard) text :owner app :name "loom"))))
+
+(defun selection-text (app)
+  "The text APP has HIGHLIGHTED RIGHT NOW, or NIL when nothing is — the page's own
+   live selection state, the very state the highlight is painted from, and never the
+   clipboard.  The two answer different questions: the clipboard remembers what was
+   last copied and outlives the highlight on purpose, so asking it \"what is selected?\"
+   is how you end up speaking words that stopped being selected some time ago.
+
+   A collapsed selection — the ordinary click that dismisses a highlight — is NOT a
+   selection, and reads as NIL here, which is what makes \"tap, then right-click\" offer
+   nothing.  Taken under the app lock, like every other reader of the page."
+  (sb-thread:with-mutex ((glass-app-lock app))
+    (let* ((pg (glass-app-page app))
+           (text (and pg (ignore-errors (loom:selection-string pg)))))
+      (and (stringp text) (plusp (length text)) text))))
 
 (defun wire-navigation (app)
   "Install the current page's callbacks: a clicked link opens a new CHILD of the
    current node (a branch) through NAVIGATE, and a finished text selection goes
-   onto the session clipboard."
+   onto the session clipboard (when *COPY-ON-SELECT*)."
   (let ((pg (glass-app-page app)))
     (when pg
       (setf (loom:page-on-navigate pg)
