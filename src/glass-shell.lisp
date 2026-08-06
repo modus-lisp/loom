@@ -373,8 +373,8 @@
             (when (nav-node-page node) (wire-navigation app)))
           (setf (glass-app-dirty app) t))))))
 
-(defun publish-selection (text)
-  "Put TEXT on the session clipboard with loom as the owner.
+(defun publish-selection (app text)
+  "Put TEXT on the session clipboard with APP — this browser window — as the owner.
 
    Selecting IS copying — the X11 PRIMARY convention — so there is no copy key and
    no copy button, which matters because the touch client has neither: its
@@ -383,12 +383,18 @@
    ServerCutText with this string within one sender tick, and any desktop app that
    asks (say, to speak it) sees the same value.
 
+   The owner is the APP OBJECT and not a bare :LOOM, because X11's owner is a
+   WINDOW: it answers \"which one of you is holding the selection right now?\", and
+   two browser windows are two answers.  Anything that wants to act on the selection
+   where it lives — a context menu over the text, say — needs that distinction, and
+   the display name stays \"loom\" so a clipboard report reads the same as before.
+
    The desktop is one session and this is its one clipboard, so a failure here must
    not take the browser down with it — a selection is still a selection even if
    nobody is listening."
   (when (and text (plusp (length text)))
     (ignore-errors
-     (glass:clipboard-set (glass:session-clipboard) text :owner :loom :name "loom"))))
+     (glass:clipboard-set (glass:session-clipboard) text :owner app :name "loom"))))
 
 (defun wire-navigation (app)
   "Install the current page's callbacks: a clicked link opens a new CHILD of the
@@ -399,7 +405,7 @@
       (setf (loom:page-on-navigate pg)
             (lambda (p target) (declare (ignore p)) (navigate app target))
             (loom:page-on-selection pg)
-            (lambda (p text) (declare (ignore p)) (publish-selection text))))))
+            (lambda (p text) (declare (ignore p)) (publish-selection app text))))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; RFB input -> page-model calls (the SDL shell's handle-event, over RFB)
