@@ -24,6 +24,9 @@
    ;; input -> DOM
    #:node-at-page #:mouse-press #:mouse-release #:mouse-move #:mouse-wheel
    #:key-down #:key-text #:link-at #:anchor-href
+   ;; document text selection: the shell publishes ON-SELECTION to the clipboard
+   #:page-selection #:page-on-selection #:selection-string #:select-all
+   #:clear-selection #:doc-position-at
    ;; pure helpers (headless-testable)
    #:pointer-button->dom #:wheel->scroll-delta #:clamp-scroll #:resolve-url
    #:*wheel-step*))

@@ -18,6 +18,10 @@
   (scroll-y 0)
   (press-node nil)                      ; node that received the last mousedown
   (drag-control nil)                    ; text control a press landed in: motion while held extends its selection
+  (selection nil)                       ; the document text selection (a weft TEXT-SELECTION), or NIL
+  (selecting nil)                       ; T while the button is down on a document selection drag
+  (repaint nil)                         ; closure from RENDER-DOCUMENT: repaint this box tree with a given selection
+  (on-selection nil)                    ; (page text) -> t : the shell publishes a finished selection
   (open-select nil)                     ; the <select> whose popup is showing (it has no layout box)
   (menu-index 0)                        ; row the popup's highlight is on
   (hover-node nil)                      ; node currently under the pointer
@@ -844,7 +848,7 @@ Returns T when a config was found and applied."
    FETCH-LAZY is NIL the post-layout lazy pass only defers (a probe layout to learn
    in-view positions); T fills the in-view lazy set (from the warmed cache).  Returns
    the laid-out box tree ROOT (so the caller can inspect it for in-view lazy images)."
-  (multiple-value-bind (cv root styles)
+  (multiple-value-bind (cv root styles repaint)
       (let ((r:*image-loader* (page-image-loader pg))   ; network <img> over seal, cached
             (r:*font-loader* (page-font-loader pg))     ; @font-face web fonts over seal
             (r:*progress* #'report-progress)            ; :cascade / :layout / :painting
@@ -864,12 +868,17 @@ Returns T when a config was found and applied."
         ;; VIEWPORT-HEIGHT/SCROLL-TO only take effect when the page clips at the root
         ;; (a viewport-model page like Acid2); a normal page ignores them and its
         ;; canvas still grows to content height (reader view).
+        ;; The selection is (text node, offset) pairs, so it outlives the box tree
+        ;; it was made on: a re-render after a script mutation or a resize re-lays
+        ;; the text and the same characters come back highlighted.
         (r:render-document (page-doc pg) :width (page-width pg) :css (page-css pg)
                            :viewport-height (page-viewport-height pg)
-                           :scroll-to (page-fragment pg)))
+                           :scroll-to (page-fragment pg)
+                           :selection (page-selection pg)))
     (setf (page-canvas pg) cv
           (page-root pg) root
           (page-styles pg) styles
+          (page-repaint pg) repaint
           (page-content-height pg) (r:canvas-height cv)
           (page-scroll-y pg) (clamp-scroll (page-scroll-y pg)
                                             (r:canvas-height cv) (page-viewport-height pg)))
@@ -995,6 +1004,102 @@ Returns T when a config was found and applied."
 (defun node-at-page (pg vx vy)
   "The DOM node under viewport point (VX,VY), accounting for the scroll offset."
   (and (page-root pg) (r:node-at (page-root pg) vx (+ vy (page-scroll-y pg)))))
+
+;;; ---------------------------------------------------------------------------
+;;; Document text selection  (press -> drag -> release, X11 PRIMARY style)
+;;; ---------------------------------------------------------------------------
+;;; The anchor is where the button went down, the focus follows the pointer, and
+;;; the release publishes the text.  There is no copy gesture: selecting IS
+;;; copying, which is the one interaction that needs neither a keyboard nor a
+;;; second button — the only kind the phone's press-and-hold-to-grab can produce.
+;;;
+;;; This sits BESIDE the form-control drag (PAGE-DRAG-CONTROL), never over it: a
+;;; press inside an <input> arms that one and this one stands down, so the two
+;;; never both interpret the same motion.
+
+(defun doc-position-at (pg vx vy)
+  "Viewport point (VX,VY) as (values TEXT-NODE OFFSET DIRECT-P) in the laid-out
+   document, or NIL when the page has no selectable text."
+  (and (page-root pg)
+       (r:text-position-at (page-root pg) vx (+ vy (page-scroll-y pg)))))
+
+(defun repaint-selection (pg)
+  "Repaint the current box tree with the current selection and no relayout.
+
+   A selection moves no boxes, so a drag must not re-cascade and re-lay-out the
+   document for every pointer packet — on a long article that is the difference
+   between a selection that follows the pointer and one that lurches after it.
+   The closure came from the render that built this box tree, so the repaint is
+   the same picture with different pixels behind the glyphs."
+  (let ((rp (page-repaint pg)))
+    (when rp
+      (setf (page-canvas pg) (funcall rp (page-selection pg)))
+      (paint-open-menu pg)
+      t)))
+
+(defun start-doc-selection (pg vx vy)
+  "Begin a selection at viewport (VX,VY): anchor there, collapsed.  Any previous
+   selection goes away, which is why the repaint happens even though the new
+   selection paints nothing — the old highlight has to come off."
+  (let ((had (not (r:selection-collapsed-p (page-selection pg)))))
+    (multiple-value-bind (n o) (doc-position-at pg vx vy)
+      (setf (page-selection pg) (and n (r:make-text-selection n o))
+            (page-selecting pg) (and n t)))
+    (when had (repaint-selection pg))))
+
+(defun extend-doc-selection (pg vx vy)
+  "Move the focus of the in-progress selection to viewport (VX,VY).
+
+   Repaints only when the focus lands on a DIFFERENT character: the shell reports
+   motion on every pointer packet, and most of them are still inside the glyph the
+   last one was in.  Without this the repaint rate is the packet rate rather than
+   the rate the highlight actually changes."
+  (when (and (page-selecting pg) (page-selection pg))
+    (multiple-value-bind (n o) (doc-position-at pg vx vy)
+      (when n
+        (let ((old (page-selection pg)))
+          (unless (and (eq n (r:text-selection-focus-node old))
+                       (eql o (r:text-selection-focus-offset old)))
+            (setf (page-selection pg) (r:selection-extend old n o))
+            (repaint-selection pg)))))))
+
+(defun end-doc-selection (pg)
+  "Finish a selection drag and hand the text to the shell.  A COLLAPSED selection
+   — an ordinary click — publishes nothing, so clicking a link does not wipe a
+   clipboard someone else filled."
+  (when (page-selecting pg)
+    (setf (page-selecting pg) nil)
+    (let ((txt (and (page-root pg) (page-selection pg)
+                    (r:selection-text (page-root pg) (page-selection pg)))))
+      (when (and txt (plusp (length txt)) (page-on-selection pg))
+        (ignore-errors (funcall (page-on-selection pg) pg txt))
+        txt))))
+
+(defun selection-string (pg)
+  "The page's current selection as text, or NIL."
+  (and (page-root pg) (page-selection pg)
+       (r:selection-text (page-root pg) (page-selection pg))))
+
+(defun clear-selection (pg)
+  "Drop any selection and take its highlight off the page."
+  (when (page-selection pg)
+    (setf (page-selection pg) nil (page-selecting pg) nil)
+    (repaint-selection pg)))
+
+(defun select-all (pg)
+  "Select the whole document — the one selection that needs no pointer."
+  (let ((root (page-root pg)))
+    (when root
+      (multiple-value-bind (sn so) (r:select-all-position root :start)
+        (multiple-value-bind (en eo) (r:select-all-position root :end)
+          (when sn
+            (setf (page-selection pg) (r:make-text-selection sn so en eo)
+                  (page-selecting pg) nil)
+            (repaint-selection pg)
+            (let ((txt (selection-string pg)))
+              (when (and txt (plusp (length txt)) (page-on-selection pg))
+                (ignore-errors (funcall (page-on-selection pg) pg txt)))
+              txt)))))))
 
 (defun anchor-href (node)
   "The href of NODE or its nearest ancestor <a>, or NIL — so a click on inline
@@ -1161,6 +1266,11 @@ Returns T when a config was found and applied."
                                            :button button :client-x vx :client-y vy)
                   t)))
       (when (and go (zerop button)) (focus-at pg n vx vy)))
+    ;; A press that did NOT land in a text widget starts a document selection.
+    ;; FOCUS-AT has already decided that, so asking after it is what keeps the two
+    ;; drags from both claiming the same motion.
+    (when (and (zerop button) (not (page-drag-control pg)))
+      (start-doc-selection pg vx vy))
     (pump pg)
     n))
 
@@ -1176,6 +1286,9 @@ Returns T when a config was found and applied."
       (let ((go (ws:dispatch-mouse-event ctx n "click"
                                          :button button :client-x vx :client-y vy :detail 1)))
         (when (and go (zerop button)) (maybe-follow-link pg n))))
+    ;; Publish before the state is torn down: a finished selection is the
+    ;; clipboard's only producer.
+    (when (zerop button) (end-doc-selection pg))
     (setf (page-press-node pg) nil
           (page-drag-control pg) nil)
     (pump pg)
@@ -1209,9 +1322,13 @@ Returns T when a config was found and applied."
     ;; until the button comes up.  PRESS-NODE is the button-is-down flag: the
     ;; shell reports motion whether or not anything is held.
     (let ((dc (page-drag-control pg)))
-      (when (and dc (page-press-node pg) ctx)
-        (let ((i (caret-offset-at pg dc vx vy (ws:focus-caret ctx dc))))
-          (when i (ws:extend-selection-to ctx dc i)))))
+      (if (and dc (page-press-node pg) ctx)
+          (let ((i (caret-offset-at pg dc vx vy (ws:focus-caret ctx dc))))
+            (when i (ws:extend-selection-to ctx dc i)))
+          ;; no widget claimed the press: motion extends the DOCUMENT selection.
+          ;; PAGE-SELECTING is the held flag here rather than PRESS-NODE, because a
+          ;; press on blank page area hits no node but still starts a selection.
+          (extend-doc-selection pg vx vy)))
     (unless (eq n prev)
       (when prev (ws:dispatch-mouse-event ctx prev "mouseout" :client-x vx :client-y vy))
       (when n (ws:dispatch-mouse-event ctx n "mouseover" :client-x vx :client-y vy))

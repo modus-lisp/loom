@@ -373,12 +373,33 @@
             (when (nav-node-page node) (wire-navigation app)))
           (setf (glass-app-dirty app) t))))))
 
+(defun publish-selection (text)
+  "Put TEXT on the session clipboard with loom as the owner.
+
+   Selecting IS copying — the X11 PRIMARY convention — so there is no copy key and
+   no copy button, which matters because the touch client has neither: its
+   press-and-hold-to-grab produces a press, a drag and a release and nothing else.
+   The clipboard notifies on its own, so every connected RFB viewer receives a
+   ServerCutText with this string within one sender tick, and any desktop app that
+   asks (say, to speak it) sees the same value.
+
+   The desktop is one session and this is its one clipboard, so a failure here must
+   not take the browser down with it — a selection is still a selection even if
+   nobody is listening."
+  (when (and text (plusp (length text)))
+    (ignore-errors
+     (glass:clipboard-set (glass:session-clipboard) text :owner :loom :name "loom"))))
+
 (defun wire-navigation (app)
-  "Install the current page's on-navigate callback so a clicked link opens a new
-   CHILD of the current node (a branch), through NAVIGATE."
+  "Install the current page's callbacks: a clicked link opens a new CHILD of the
+   current node (a branch) through NAVIGATE, and a finished text selection goes
+   onto the session clipboard."
   (let ((pg (glass-app-page app)))
-    (when pg (setf (loom:page-on-navigate pg)
-                   (lambda (p target) (declare (ignore p)) (navigate app target))))))
+    (when pg
+      (setf (loom:page-on-navigate pg)
+            (lambda (p target) (declare (ignore p)) (navigate app target))
+            (loom:page-on-selection pg)
+            (lambda (p text) (declare (ignore p)) (publish-selection text))))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; RFB input -> page-model calls (the SDL shell's handle-event, over RFB)
