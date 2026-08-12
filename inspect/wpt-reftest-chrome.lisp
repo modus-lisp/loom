@@ -30,9 +30,10 @@
 
 (require :asdf)
 (let ((ql "/home/claude/quicklisp/setup.lisp")) (when (probe-file ql) (load ql)))
-(push (truename "/home/claude/loom/") asdf:*central-registry*)
-(push (truename "/home/claude/weft/") asdf:*central-registry*)
-(push (truename "/home/claude/shuttle/") asdf:*central-registry*)
+;; Sibling repos, found relative to this file so the workspace can live anywhere.
+(asdf:initialize-source-registry
+ (let ((here (make-pathname :name nil :type nil :defaults *load-truename*)))
+   `(:source-registry (:tree ,(merge-pathnames "../../" here)) :inherit-configuration)))
 (handler-bind ((warning #'muffle-warning)) (asdf:load-system "loom"))
 
 (defpackage #:wpt-ref-chrome
@@ -49,7 +50,9 @@
 (defparameter *timeout* 30)
 (defparameter *dump* (and (uiop:getenv "DUMP") t))
 (defparameter *dump-dir* "/tmp/wpt-reftest-chrome/")
-(defparameter *shot-helper* "/home/claude/loom/inspect/wpt-chrome-shot.js")
+(defparameter *shot-helper*                   ; ships beside this file
+  (namestring (merge-pathnames "wpt-chrome-shot.js"
+                               (make-pathname :name nil :type nil :defaults *load-truename*))))
 (defparameter *node* "node")
 (defparameter *scratch* "/tmp/wpt-reftest-chrome-shots/")
 

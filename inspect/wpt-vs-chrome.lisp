@@ -18,9 +18,13 @@
 ;; --script skips init files, so register the sibling projects + quicklisp
 ;; (for chipz / codecs) explicitly rather than relying on asdf's registry cache.
 (let ((ql "/home/claude/quicklisp/setup.lisp")) (when (probe-file ql) (load ql)))
-(defparameter *loom-dir* (truename "/home/claude/loom/"))
+(defparameter *loom-dir*                      ; this repo, wherever the checkout lives
+  (merge-pathnames "../" (make-pathname :name nil :type nil :defaults *load-truename*)))
 (push *loom-dir* asdf:*central-registry*)
-(push (truename "/home/claude/weft/") asdf:*central-registry*)
+;; Sibling repos, found relative to this file so the workspace can live anywhere.
+(asdf:initialize-source-registry
+ (let ((here (make-pathname :name nil :type nil :defaults *load-truename*)))
+   `(:source-registry (:tree ,(merge-pathnames "../../" here)) :inherit-configuration)))
 (handler-bind ((warning #'muffle-warning)) (asdf:load-system "loom"))
 
 (defpackage #:wpt-cmp (:use #:cl))

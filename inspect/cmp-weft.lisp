@@ -3,7 +3,10 @@
 ;;;; tag:nth-of-type chain cmp-chrome.js emits, so the two dumps line up per element.
 ;;;; Reads CMP_URL and CMP_W from the environment.
 (require :asdf)
-(push (truename "/home/claude/loom/") asdf:*central-registry*)
+;; Sibling repos, found relative to this file so the workspace can live anywhere.
+(asdf:initialize-source-registry
+ (let ((here (make-pathname :name nil :type nil :defaults *load-truename*)))
+   `(:source-registry (:tree ,(merge-pathnames "../../" here)) :inherit-configuration)))
 (handler-bind ((warning #'muffle-warning)) (asdf:load-system "loom"))
 
 (defun path-of (n)

@@ -16,7 +16,8 @@
 
 (in-package #:loom.glass)
 
-(defun smoke (&key (out "/home/claude/loom/inspect/smoke.png"))
+(defparameter *here* (make-pathname :name nil :type nil :defaults *load-truename*))
+(defun smoke (&key (out (merge-pathnames "smoke.png" *here*)))
   (let* ((home (namestring (loom::default-home)))
          (page (loom:load-file home :width 1024 :viewport-height 768)))
     (loom:render-page page)

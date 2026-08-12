@@ -17,7 +17,8 @@
 (let ((ql (merge-pathnames "quicklisp/setup.lisp" (user-homedir-pathname))))
   (when (probe-file ql) (load ql)))
 (require :asdf)
-(defparameter *loom-dir* (truename "/home/claude/loom/"))
+(defparameter *loom-dir*                      ; this repo, wherever the checkout lives
+  (merge-pathnames "../" (make-pathname :name nil :type nil :defaults *load-truename*)))
 (let ((home (merge-pathnames "../" *loom-dir*)))
   (dolist (d '("loom/" "weft/" "shuttle/" "pigment/" "cram/" "scribe/" "gesso/"
                "stencil/" "webp-pure/" "seal/" "glass/" "brotli-pure/" "zstd-pure/"))

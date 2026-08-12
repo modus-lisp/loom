@@ -11,7 +11,8 @@
 (let ((ql (merge-pathnames "quicklisp/setup.lisp" (user-homedir-pathname))))
   (when (probe-file ql) (load ql)))
 (require :asdf)
-(let ((home (truename "/home/claude/")))
+(let ((home (merge-pathnames "../../" (make-pathname :name nil :type nil
+                                                     :defaults *load-truename*))))
   (dolist (d '("loom/" "weft/" "shuttle/" "pigment/" "cram/" "scribe/" "gesso/"
                "stencil/" "webp-pure/" "seal/" "glass/" "brotli-pure/" "zstd-pure/"))
     (let ((p (merge-pathnames d home))) (when (probe-file p) (push (truename p) asdf:*central-registry*)))))
