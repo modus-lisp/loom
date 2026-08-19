@@ -513,10 +513,10 @@ magic), returning the raw font file.  Passes through when not compressed."
       (cond
         ((or (equal e "gzip") (equal e "x-gzip")
              (and (>= (length bytes) 2) (= (aref bytes 0) #x1F) (= (aref bytes 1) #x8B)))
-         (or (ignore-errors (deflate:gzip-decompress bytes)) bytes))
+         (or (ignore-errors (cram:gzip-decompress bytes)) bytes))
         ((equal e "deflate")
-         (or (ignore-errors (deflate:zlib-decompress bytes))
-             (ignore-errors (deflate:inflate bytes)) bytes))
+         (or (ignore-errors (cram:zlib-decompress bytes))
+             (ignore-errors (cram:deflate-decompress bytes)) bytes))
         (t bytes)))))
 
 (defun %wfl-slug (family)
