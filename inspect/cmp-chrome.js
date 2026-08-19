@@ -3,12 +3,12 @@
 // structural tag:nth-of-type chain from the root, so it matches the weft dump for
 // the same HTML.  JS is disabled so the SSR markup is laid out with real CSS — the
 // same input weft renders.  Usage: node cmp-chrome.js <url> [width]
-const { chromium } = require('/home/claude/pw/node_modules/playwright');
+const { chromium } = require((process.env.PW_HOME || require('os').homedir() + '/pw') + '/node_modules/playwright');
 (async () => {
   const url = process.argv[2];
   const W = parseInt(process.argv[3] || '1024', 10);
   const browser = await chromium.launch({
-    executablePath: '/home/claude/.cache/ms-playwright/chromium-1148/chrome-linux/chrome',
+    executablePath: process.env.CHROME_PATH || require('os').homedir() + '/.cache/ms-playwright/chromium-1148/chrome-linux/chrome',
   });
   const ctx = await browser.newContext({ viewport: { width: W, height: 900 }, javaScriptEnabled: false });
   const page = await ctx.newPage();

@@ -4,7 +4,7 @@
 // (Range.selectNodeContents(el).getClientRects(), merged by top) — the per-line
 // signal that reveals line-breaking / white-space / justify / rtl behaviour.
 // Output: <outdir>/<basename>.chrome.json.  Args: <files-file> <outdir> <width>.
-const { chromium } = require('/home/claude/pw/node_modules/playwright');
+const { chromium } = require((process.env.PW_HOME || require('os').homedir() + '/pw') + '/node_modules/playwright');
 const fs = require('fs');
 const path = require('path');
 
@@ -69,7 +69,7 @@ const DUMP = () => {
 
 (async () => {
   const browser = await chromium.launch({
-    executablePath: '/home/claude/.cache/ms-playwright/chromium-1148/chrome-linux/chrome',
+    executablePath: process.env.CHROME_PATH || require('os').homedir() + '/.cache/ms-playwright/chromium-1148/chrome-linux/chrome',
   });
   for (const file of files) {
     const base = path.basename(file).replace(/\.html?$/, '');

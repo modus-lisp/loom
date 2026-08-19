@@ -26,7 +26,7 @@
 ;;;; test/ref PNGs of the first few passes+fails to /tmp/wpt-reftest for eyeballing.
 
 (require :asdf)
-(let ((ql "/home/claude/quicklisp/setup.lisp")) (when (probe-file ql) (load ql)))
+(let ((ql "~/quicklisp/setup.lisp")) (when (probe-file ql) (load ql)))
 ;; Sibling repos, found relative to this file so the workspace can live anywhere.
 (asdf:initialize-source-registry
  (let ((here (make-pathname :name nil :type nil :defaults *load-truename*)))
@@ -41,7 +41,7 @@
 (defparameter *args* (cdr sb-ext:*posix-argv*))
 (defparameter *category* (or (first *args*) "css/css-flexbox"))
 (defparameter *limit* (and (second *args*) (parse-integer (second *args*) :junk-allowed t)))
-(defparameter *wpt-root* (truename (or (third *args*) "/home/claude/wpt/")))
+(defparameter *wpt-root* (truename (or (third *args*) (uiop:getenv "WPT_ROOT") "~/wpt/")))
 (defparameter *width* 800)
 (defparameter *min-height* 600)
 (defparameter *max-height* 3000)

@@ -29,7 +29,7 @@
 ;;;; PNGs of the first few passes/fails to /tmp/wpt-reftest-chrome for eyeballing.
 
 (require :asdf)
-(let ((ql "/home/claude/quicklisp/setup.lisp")) (when (probe-file ql) (load ql)))
+(let ((ql "~/quicklisp/setup.lisp")) (when (probe-file ql) (load ql)))
 ;; Sibling repos, found relative to this file so the workspace can live anywhere.
 (asdf:initialize-source-registry
  (let ((here (make-pathname :name nil :type nil :defaults *load-truename*)))
@@ -44,7 +44,7 @@
 (defparameter *args* (cdr sb-ext:*posix-argv*))
 (defparameter *category* (or (first *args*) "css/css-backgrounds"))
 (defparameter *limit* (and (second *args*) (parse-integer (second *args*) :junk-allowed t)))
-(defparameter *wpt-root* (truename (or (third *args*) "/home/claude/wpt/")))
+(defparameter *wpt-root* (truename (or (third *args*) (uiop:getenv "WPT_ROOT") "~/wpt/")))
 (defparameter *width* 800)
 (defparameter *height* 600)                 ; weft canvas forced to Chrome's clip size
 (defparameter *timeout* 30)

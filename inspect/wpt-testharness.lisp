@@ -23,7 +23,7 @@
 ;;;; every subtest PASSed.  Buckets: pass / fail / timeout / error / no-result.
 
 (require :asdf)
-(let ((ql "/home/claude/quicklisp/setup.lisp")) (when (probe-file ql) (load ql)))
+(let ((ql "~/quicklisp/setup.lisp")) (when (probe-file ql) (load ql)))
 ;; Sibling repos, found relative to this file so the workspace can live anywhere.
 (asdf:initialize-source-registry
  (let ((here (make-pathname :name nil :type nil :defaults *load-truename*)))
@@ -44,7 +44,7 @@
 (defparameter *args* (cdr sb-ext:*posix-argv*))
 (defparameter *category* (or (first *args*) "css/css-values"))
 (defparameter *limit* (and (second *args*) (parse-integer (second *args*) :junk-allowed t)))
-(defparameter *wpt-root* (namestring (truename (or (third *args*) "/home/claude/wpt/"))))
+(defparameter *wpt-root* (namestring (truename (or (third *args*) (uiop:getenv "WPT_ROOT") "~/wpt/"))))
 (defparameter *width* (or (and (fourth *args*) (parse-integer (fourth *args*) :junk-allowed t)) 800))
 (defparameter *timeout* 45)   ; per-file wall-clock cap; must exceed *js-budget* above
 

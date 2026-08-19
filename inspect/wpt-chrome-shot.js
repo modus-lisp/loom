@@ -8,7 +8,7 @@
 // buckets that test as :error rather than crediting a false pass).
 //
 // Args: <manifest-file> [width] [height].  No LLM; cron-safe.
-const { chromium } = require('/home/claude/pw/node_modules/playwright');
+const { chromium } = require((process.env.PW_HOME || require('os').homedir() + '/pw') + '/node_modules/playwright');
 const fs = require('fs');
 
 const manifest = process.argv[2];
@@ -21,7 +21,7 @@ const entries = fs.readFileSync(manifest, 'utf-8')
 
 (async () => {
   const browser = await chromium.launch({
-    executablePath: '/home/claude/.cache/ms-playwright/chromium-1148/chrome-linux/chrome',
+    executablePath: process.env.CHROME_PATH || require('os').homedir() + '/.cache/ms-playwright/chromium-1148/chrome-linux/chrome',
     args: ['--force-color-profile=srgb', '--disable-lcd-text'],
   });
   let ok = 0, fail = 0;

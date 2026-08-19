@@ -3,7 +3,7 @@
 // element's box geometry (JS off, so the SSR markup is laid out with real CSS) as
 // TSV to <outdir>/<index>.chrome.tsv.  A page that fails writes <index>.chrome.err.
 // Args: <links-file> <outdir> <width>.  No LLM, cron-safe.
-const { chromium } = require('/home/claude/pw/node_modules/playwright');
+const { chromium } = require((process.env.PW_HOME || require('os').homedir() + '/pw') + '/node_modules/playwright');
 const fs = require('fs');
 
 const linksFile = process.argv[2];
@@ -38,7 +38,7 @@ const DUMP = () => {
 
 (async () => {
   const browser = await chromium.launch({
-    executablePath: '/home/claude/.cache/ms-playwright/chromium-1148/chrome-linux/chrome',
+    executablePath: process.env.CHROME_PATH || require('os').homedir() + '/.cache/ms-playwright/chromium-1148/chrome-linux/chrome',
   });
   for (let i = 0; i < urls.length; i++) {
     let ctx, page;

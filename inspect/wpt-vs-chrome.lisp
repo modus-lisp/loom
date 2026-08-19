@@ -13,11 +13,11 @@
 ;;;;
 ;;;;   sbcl --dynamic-space-size 4096 --script inspect/wpt-vs-chrome.lisp \
 ;;;;        <wpt-root> <category> [limit] [width]
-;;;;   e.g.  … /home/claude/wpt css/css-sizing 200
+;;;;   e.g.  … ~/wpt css/css-sizing 200
 (require :asdf)
 ;; --script skips init files, so register the sibling projects + quicklisp
 ;; (for chipz / codecs) explicitly rather than relying on asdf's registry cache.
-(let ((ql "/home/claude/quicklisp/setup.lisp")) (when (probe-file ql) (load ql)))
+(let ((ql "~/quicklisp/setup.lisp")) (when (probe-file ql) (load ql)))
 (defparameter *loom-dir*                      ; this repo, wherever the checkout lives
   (merge-pathnames "../" (make-pathname :name nil :type nil :defaults *load-truename*)))
 (push *loom-dir* asdf:*central-registry*)
@@ -31,7 +31,7 @@
 (in-package #:wpt-cmp)
 
 (defparameter *args* (cdr sb-ext:*posix-argv*))
-(defparameter *wpt-root* (truename (or (first *args*) "/home/claude/wpt/")))
+(defparameter *wpt-root* (truename (or (first *args*) (uiop:getenv "WPT_ROOT") "~/wpt/")))
 (defparameter *category* (or (second *args*) "css/css-sizing"))
 (defparameter *limit* (and (third *args*) (parse-integer (third *args*) :junk-allowed t)))
 (defparameter *width* (or (and (fourth *args*) (parse-integer (fourth *args*) :junk-allowed t)) 800))
