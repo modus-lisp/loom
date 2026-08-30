@@ -10,9 +10,18 @@
 ;; --script skips ~/.sbclrc, so bootstrap quicklisp explicitly for the deps.
 (let ((ql (merge-pathnames "quicklisp/setup.lisp" (user-homedir-pathname))))
   (when (probe-file ql) (load ql)))
-(push (truename (merge-pathnames "../" (directory-namestring *load-truename*)))
-      asdf:*central-registry*)
-(funcall (read-from-string "ql:quickload") :loom/glass :silent t)
+;; SIBLING REPOS BY TREE, NOT BY LIST.  This used to name loom's dependencies one
+;; directory at a time, which meant every new dependency had to be remembered here
+;; as well as in loom.asd — and when `folio' (the PDF engine) was added, it was not.
+;; ASDF then resolved "folio" to the UNRELATED 2013 library of the same name in the
+;; quicklisp dist, which loads perfectly and defines no FOLIO package, so this gate
+;; died in a read error about a package rather than a missing system.  A :tree finds
+;; whatever the workspace actually contains, and cannot fall out of date.
+(asdf:initialize-source-registry
+ (let ((here (make-pathname :name nil :type nil :defaults *load-truename*)))
+   `(:source-registry (:tree ,(merge-pathnames "../../" here))
+                      (:exclude "vendor") (:exclude "deps") :inherit-configuration)))
+(handler-bind ((warning #'muffle-warning)) (asdf:load-system "loom/glass"))
 
 (in-package #:loom.glass)
 

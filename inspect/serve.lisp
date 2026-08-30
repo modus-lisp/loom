@@ -16,11 +16,17 @@
 ;; central registry.  --script skips the init file, so quicklisp's local-projects
 ;; are not scanned; register the sibling dirs explicitly so loom's dependency on
 ;; weft/render + shuttle resolves without quicklisp.
-(let ((loomdir (merge-pathnames "../" (directory-namestring *load-truename*))))
-  (dolist (d (list loomdir
-                   (merge-pathnames "../weft/" loomdir)
-                   (merge-pathnames "../shuttle/" loomdir)))
-    (when (probe-file d) (push (truename d) asdf:*central-registry*))))
+;; SIBLING REPOS BY TREE, NOT BY LIST.  This used to name loom's dependencies one
+;; directory at a time, which meant every new dependency had to be remembered here
+;; as well as in loom.asd — and when `folio' (the PDF engine) was added, it was not.
+;; ASDF then resolved "folio" to the UNRELATED 2013 library of the same name in the
+;; quicklisp dist, which loads perfectly and defines no FOLIO package, so this gate
+;; died in a read error about a package rather than a missing system.  A :tree finds
+;; whatever the workspace actually contains, and cannot fall out of date.
+(asdf:initialize-source-registry
+ (let ((here (make-pathname :name nil :type nil :defaults *load-truename*)))
+   `(:source-registry (:tree ,(merge-pathnames "../../" here))
+                      (:exclude "vendor") (:exclude "deps") :inherit-configuration)))
 (handler-bind ((warning #'muffle-warning))
   (asdf:load-system "loom"))
 
