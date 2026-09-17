@@ -127,6 +127,47 @@
                          (%sqlq (string kind)) (%sqlq (or url ""))
                          (%sqlq (princ-to-string detail))))))
 
+;;; ---- what this service may fetch ------------------------------------------
+;;; THIS IS A PUBLIC, UNAUTHENTICATED SERVICE, and /go hands its `url' parameter to
+;;; the engine.  loom the LIBRARY reads file:// from disk on purpose (page.lisp) --
+;;; that is right for loom-as-browser, where the person typing the URL already owns
+;;; the filesystem.  Reached over the network it is a file-disclosure hole instead:
+;;; the raster IS the reply, so `file:///etc/passwd' comes back as a readable
+;;; picture of the file.  Same capability, opposite meaning -- so the refusal lives
+;;; HERE, at the service boundary, and the library keeps the capability intact.
+;;;
+;;; Note the scheme is checked on the NORMALISED url (a bare "example.com" has
+;;; already had https:// prepended), and on EVERY navigation rather than just the
+;;; typed one -- a page's own links arrive through this same function with
+;;; :fresh nil, and a link is exactly as attacker-controlled as an address bar.
+
+(defparameter *allowed-schemes*
+  (if (uiop:getenv "LOOM_ALLOW_FILE") '("http" "https" "file") '("http" "https"))
+  "URL schemes navigation may follow.  file:// is OFF unless LOOM_ALLOW_FILE is set:
+   reading local disk is a capability the operator opts into, not a default -- the
+   same rule the listening socket follows.")
+
+(defun %url-scheme (url)
+  "URL's scheme, downcased, or NIL when it has none.  Scheme grammar is RFC 3986
+   §3.1: ALPHA *( ALPHA / DIGIT / \"+\" / \"-\" / \".\" ), so a bare path or a
+   \"host:port\" with a non-alpha start is correctly reported as scheme-less."
+  (let ((c (position #\: url)))
+    (when (and c (plusp c) (alpha-char-p (char url 0))
+               (every (lambda (ch)
+                        (or (alpha-char-p ch) (digit-char-p ch) (find ch "+-.")))
+                      (subseq url 0 c)))
+      (string-downcase (subseq url 0 c)))))
+
+(defun check-navigable (url)
+  "Signal unless URL's scheme is one this service is willing to fetch.  Signalling
+   (rather than returning a flag) puts the refusal on the path that already logs and
+   shows a failed navigation, so a blocked URL reports itself like any other error."
+  (let ((s (%url-scheme url)))
+    (unless (member s *allowed-schemes* :test #'string=)
+      (error "refusing to navigate to ~a — this service follows ~{~a~^/~} only"
+             (if s (format nil "a ~a: URL" s) "a scheme-less URL")
+             *allowed-schemes*))))
+
 ;;; ---- browsing -------------------------------------------------------------
 (defun navigate-tab (tab url &key (fresh t))
   "Load URL into TAB.  FRESH (a typed URL / address-bar open) starts a NEW browsing
@@ -142,14 +183,16 @@
         (u (if (or (search "://" url) (eql 0 (search "http" url))) url
                (concatenate 'string "https://" url))))
    (handler-case
-      (let ((pg (l:load-url u :width (tab-width tab) :viewport-height vph :cookie-jar jar)))
+      (progn
+       (check-navigable u)
+       (let ((pg (l:load-url u :width (tab-width tab) :viewport-height vph :cookie-jar jar)))
         ;; a link followed inside this tab stays in the same context (fresh nil)
         (setf (l:page-on-navigate pg)
               (lambda (p tgt) (declare (ignore p)) (navigate-tab tab tgt :fresh nil)))
         (when (l:page-js-error pg) (log-error "script" url (l:page-js-error pg)))
         (setf (tab-page tab) pg
               (tab-status tab) (format nil "~a  —  ~a" (or (l:page-title pg) "") (or (l:page-url pg) url)))
-        (incf (tab-gen tab)))
+        (incf (tab-gen tab))))
     (error (e)
       (log-error "navigate" url e)
       (setf (tab-status tab) (format nil "couldn't load ~a  (~a)" url e))))))
