@@ -238,6 +238,11 @@
   "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1"
   "The User-Agent advertised when rendering at a phone-shaped width.")
 
+(defparameter *honest-user-agent*
+  "weft/0.1 (+https://github.com/modus-lisp/weft)"
+  "What we are, named plainly, with somewhere for an operator to look us up.  Used
+   when a browser claim has just been refused -- see %FETCH-FOR-RENDER.")
+
 (defparameter *mobile-ua-max-width* 600
   "Render widths below this ask the network for the MOBILE site.  600 sits above a
    phone in portrait (390-430) and below a tablet (768+), which is roughly where
@@ -281,19 +286,29 @@
     (nreverse out)))
 
 (defun viewport-meta-width (doc)
-  "The layout width DOC asks for: an integer of CSS px for `width=<n>', :DEVICE for
-   `width=device-width', NIL when it does not say.  Only the width directive is read
-   -- the scale directives describe ZOOM, which a raster client applies itself."
+  "What <meta name=viewport> asks the LAYOUT viewport to be:
+     (:WIDTH . n)  an explicit `width=<n>'
+     :DEVICE       `width=device-width'
+     (:SCALE . s)  no width, but an `initial-scale' -- the width follows FROM the
+                   scale, since scaling the device width by s is what was asked for.
+                   m.slashdot.org ships exactly this (`initial-scale=1,
+                   minimum-scale=1') and it means device-width, not the 980 default.
+     NIL           the document says nothing.
+   The other scale directives bound ZOOM, not layout, so they are not read here."
   (dolist (n (css:query-select-all doc "meta"))
     (let ((name (dom:get-attribute n "name")))
       (when (and name (string-equal (string-trim " " name) "viewport"))
-        (let ((w (cdr (assoc "width" (%viewport-directives (or (dom:get-attribute n "content") ""))
-                             :test #'string=))))
-          (when w
-            (return-from viewport-meta-width
-              (cond ((string= w "device-width") :device)
-                    ((and (plusp (length w)) (every #'digit-char-p w)) (parse-integer w))
-                    (t nil)))))))))
+        (let* ((ds (%viewport-directives (or (dom:get-attribute n "content") "")))
+               (w (cdr (assoc "width" ds :test #'string=)))
+               (sc (cdr (assoc "initial-scale" ds :test #'string=))))
+          (return-from viewport-meta-width
+            (cond ((and w (string= w "device-width")) :device)
+                  ((and w (plusp (length w)) (every #'digit-char-p w))
+                   (cons :width (parse-integer w)))
+                  (sc (let ((f (ignore-errors
+                                 (let ((*read-eval* nil)) (read-from-string sc)))))
+                        (when (and (realp f) (plusp f)) (cons :scale (float f)))))
+                  (t nil))))))))
 
 ;;; THE LAYOUT VIEWPORT IS NOT THE SCREEN.  A phone does not lay a page out at 390px
 ;;; and hope; it lays out at the width the page ASKS for -- `width=1000', or 980 by
@@ -313,12 +328,19 @@
 ;;; arrives already scaled to the screen, still clickable, and pinch-zoomable.
 
 (defun effective-layout-width (requested doc)
-  "The width to lay DOC out at for a client whose viewport is REQUESTED px wide."
+  "The width to lay DOC out at for a client whose viewport is REQUESTED px wide.
+   Never narrower than the client: a layout viewport smaller than the screen would
+   leave the page unable to fill it, which no browser does."
   (if (or (null doc) (>= requested *mobile-ua-max-width*))
       requested
       (let ((m (viewport-meta-width doc)))
         (cond ((eq m :device) requested)
-              ((and (integerp m) (plusp m)) (max requested m))
+              ((and (consp m) (eq (car m) :width)) (max requested (cdr m)))
+              ;; `initial-scale=s' with no width: the page asked for the device width
+              ;; scaled by s, so the layout viewport is that much bigger (s=1 is
+              ;; device-width; s=0.5 asks for twice the room and zooms out to fit).
+              ((and (consp m) (eq (car m) :scale))
+               (max requested (round requested (cdr m))))
               (t (max requested *default-mobile-layout-width*))))))
 
 (defun load-page (html &key (css "") (base "") (width 1024) (viewport-height 768) url fragment loader image-loader cookie-jar)
@@ -870,6 +892,78 @@ Returns T when a config was found and applied."
       (pdf-error-page (princ-to-string e) :width width
                       :viewport-height viewport-height :url url))))
 
+(defparameter *thin-document-chars* 200
+  "Below this much visible text a fetched document is a shell, not a page.")
+
+(defun %visible-text-length (html)
+  "Roughly how much text HTML would show: markup, <script> and <style> excluded.
+   Deliberately a scan over the source rather than a parse -- it runs on a candidate
+   document to decide whether that candidate is worth parsing at all."
+  (let ((n (length html)) (i 0) (count 0))
+    (loop while (< i n) do
+      (let ((c (char html i)))
+        (cond ((char= c #\<)
+               (let* ((lower (string-downcase (subseq html i (min n (+ i 8)))))
+                      (skip-to (cond ((eql 0 (search "<script" lower)) "</script")
+                                     ((eql 0 (search "<style" lower)) "</style"))))
+                 (if skip-to
+                     (let ((e (search skip-to html :start2 i :test #'char-equal)))
+                       (setf i (if e (+ e (length skip-to)) n)))
+                     (let ((e (position #\> html :start i)))
+                       (setf i (if e (1+ e) n))))))
+              (t (unless (member c '(#\Space #\Tab #\Newline #\Return)) (incf count))
+                 (incf i)))))
+    count))
+
+;;; THE MOBILE DETOUR HAS TO EARN ITSELF.  Asking as a phone is what gets a site's
+;;; mobile page, but three things can go wrong, and all three showed up on one site:
+;;;   1. the mobile host refuses a browser claim over HTTP/1.1 (Cloudflare 403) --
+;;;      so re-ask without the claim, which is the honest request and is accepted;
+;;;   2. the mobile page is a JavaScript SHELL -- m.slashdot.org is 22KB of markup
+;;;      carrying SIXTEEN characters of text, hydrated by an API call we cannot
+;;;      complete, so winning access to it wins nothing;
+;;;   3. neither works, and the desktop page was the answer all along.
+;;; So the detour is taken, checked, and abandoned if it produced less than a page.
+;;; A render with no content is not a better answer than a wide one: the desktop page
+;;; laid out at its own requested width and scaled down is what a phone shows for a
+;;; site like this, and it has the stories in it.
+
+(defun %fetch-for-render (url-string desktop-ua)
+  "Fetch URL-STRING for rendering, taking the mobile detour only while it pays.
+   Assigns FETCH:*USER-AGENT* (the binding LOAD-URL established) when a different
+   identity is the one that worked, so subresources are fetched as whoever got the
+   document -- a page whose HTML and stylesheet are fetched as different clients gets
+   a 403 for the stylesheet, which renders as a page that parsed fine and is 200px
+   tall."
+  (flet ((desktop ()
+           (setf fetch:*user-agent* desktop-ua)
+           (report-progress :loading "desktop view")
+           (fetch:fetch url-string))
+         (thin-p (r)
+           (< (%visible-text-length
+               (or (ignore-errors
+                     (nth-value 0 (fetch:body-text (fetch:response-headers r)
+                                                   (fetch:response-body r))))
+                   ""))
+              *thin-document-chars*)))
+    (let ((r (fetch:fetch url-string)))
+      (if (not (eq fetch:*user-agent* *mobile-user-agent*))
+          r
+          (progn
+            ;; Refused?  Re-ask THE URL WE WERE REFUSED AT, plainly.  The phone claim
+            ;; earns the redirect to the mobile host; dropping it on the original URL
+            ;; would just walk back to the desktop site.  This is not a better
+            ;; disguise, it is the absence of one -- the request that succeeds is the
+            ;; honest one.  (The durable fix is h2, which makes the browser claim TRUE.)
+            (when (>= (fetch:response-status r) 400)
+              (let ((refused-at (or (fetch:response-url r) url-string)))
+                (setf fetch:*user-agent* *honest-user-agent*)
+                (report-progress :loading "retrying as ourselves")
+                (setf r (fetch:fetch refused-at))))
+            (if (or (>= (fetch:response-status r) 400) (thin-p r))
+                (desktop)
+                r))))))
+
 (defun load-url (url-string &key (width 1024) (viewport-height 768) cookie-jar)
   "Fetch and load URL-STRING as a fresh page (the network browsing entry).
    COOKIE-JAR isolates this browsing context (default: the ambient jar); the caller
@@ -891,24 +985,7 @@ Returns T when a config was found and applied."
                                  desktop-ua))
          (st (get-internal-real-time)))
    (let ((resp (let ((fetch:*progress* #'report-progress) (seal:*progress* #'report-progress))
-                 (let ((r (fetch:fetch url-string)))
-                   ;; A MOBILE SITE THAT WON'T HAVE US IS WORSE THAN THE DESKTOP ONE.
-                   ;; Asking as a phone is what gets the mobile layout, but it can also
-                   ;; get a door shut: slashdot.org answers a phone UA with a redirect
-                   ;; to m.slashdot.org, which answers weft with 403 (a Cloudflare
-                   ;; interstitial) no matter WHICH UA it then sees -- measured with
-                   ;; both -- while the desktop host serves us normally.  Ending up on
-                   ;; a challenge page is a worse answer than the desktop page scaled
-                   ;; down, so a refusal falls back to the desktop request rather than
-                   ;; being reported as the page.  Only on the mobile attempt, only
-                   ;; once, and it is a retreat to the ordinary request -- not an
-                   ;; attempt to get past the refusal wearing a different hat.
-                   (if (and (eq fetch:*user-agent* *mobile-user-agent*)
-                            (>= (fetch:response-status r) 400))
-                       (let ((fetch:*user-agent* desktop-ua))
-                         (report-progress :loading "mobile site refused; desktop view")
-                         (fetch:fetch url-string))
-                       r)))))
+                 (%fetch-for-render url-string desktop-ua))))
     (let* ((headers (and resp (fetch:response-headers resp)))
            (ctype (and headers (fetch:get-header headers "content-type")))
            (raw (and resp (fetch:response-body resp)))
