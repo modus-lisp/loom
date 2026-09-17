@@ -234,6 +234,93 @@
                 (loop for c across (h:dnode-children node) do (demath-dom c))))
     (t (loop for c across (h:dnode-children node) do (demath-dom c)))))
 
+(defparameter *mobile-user-agent*
+  "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1"
+  "The User-Agent advertised when rendering at a phone-shaped width.")
+
+(defparameter *mobile-ua-max-width* 600
+  "Render widths below this ask the network for the MOBILE site.  600 sits above a
+   phone in portrait (390-430) and below a tablet (768+), which is roughly where
+   sites put the boundary themselves -- and tablets are served the desktop site by
+   modern browsers anyway.")
+
+;;; WHY THE WIDTH DECIDES THE USER-AGENT.  A narrow render used to ask for pages with
+;;; a desktop Chrome UA and then lay the desktop answer out at 390px.  That is not
+;;; what a phone gets, and for a site that branches server-side it is not even a
+;;; squeezed version of the right page -- slashdot.org answers a phone UA with
+;;; `302 -> m.slashdot.org', a different site with a different layout, and answers a
+;;; desktop UA with a page that asks (via <meta name="viewport" content="width=1000">)
+;;; to be laid out at 1000px and zoomed.  Honouring neither is the one outcome that
+;;; is wrong for every site: the desktop DOM at phone width, which reads as a broken
+;;; page rather than a small one.  So the width the caller renders at IS the claim
+;;; about what kind of client this is, and the fetch has to make the same claim.
+;;;
+;;; The binding covers subresources too -- LOAD-PAGE runs inside this extent -- so a
+;;; page cannot get its mobile HTML and then its desktop CSS.
+
+(defparameter *default-mobile-layout-width* 980
+  "The layout viewport a phone-shaped client uses for a page that says nothing about
+   its viewport.  980 is the de-facto default every mobile browser adopted, and the
+   reason a non-responsive site is small-but-readable on a phone instead of broken.")
+
+(defun %viewport-directives (content)
+  "The `key=value' pairs of a <meta name=viewport> CONTENT, downcased.  The list is
+   comma separated in the spec and semicolon separated in the wild; accept both."
+  (let ((out '()) (start 0) (n (length content)))
+    (flet ((emit (s0 e0)
+             (let* ((piece (string-trim '(#\Space #\Tab #\Newline) (subseq content s0 e0)))
+                    (eq (position #\= piece)))
+               (when (and eq (plusp eq))
+                 (push (cons (string-downcase (string-trim '(#\Space #\Tab) (subseq piece 0 eq)))
+                             (string-downcase (string-trim '(#\Space #\Tab) (subseq piece (1+ eq)))))
+                       out)))))
+      (dotimes (i n) (let ((c (char content i)))
+                       (when (or (char= c #\,) (char= c #\;))
+                         (emit start i) (setf start (1+ i)))))
+      (emit start n))
+    (nreverse out)))
+
+(defun viewport-meta-width (doc)
+  "The layout width DOC asks for: an integer of CSS px for `width=<n>', :DEVICE for
+   `width=device-width', NIL when it does not say.  Only the width directive is read
+   -- the scale directives describe ZOOM, which a raster client applies itself."
+  (dolist (n (css:query-select-all doc "meta"))
+    (let ((name (dom:get-attribute n "name")))
+      (when (and name (string-equal (string-trim " " name) "viewport"))
+        (let ((w (cdr (assoc "width" (%viewport-directives (or (dom:get-attribute n "content") ""))
+                             :test #'string=))))
+          (when w
+            (return-from viewport-meta-width
+              (cond ((string= w "device-width") :device)
+                    ((and (plusp (length w)) (every #'digit-char-p w)) (parse-integer w))
+                    (t nil)))))))))
+
+;;; THE LAYOUT VIEWPORT IS NOT THE SCREEN.  A phone does not lay a page out at 390px
+;;; and hope; it lays out at the width the page ASKS for -- `width=1000', or 980 by
+;;; default -- and then scales that result down to the screen.  That is why a desktop
+;;; site on a phone is small but intact.  Laying the same DOM out at 390px instead is
+;;; the one result no browser produces: every fixed-width rail and multi-column shell
+;;; collapses, and the page reads as broken rather than as small.
+;;;
+;;; ONLY PHONE-SHAPED RENDERS GET THIS.  At >= *MOBILE-UA-MAX-WIDTH* the caller is a
+;;; window, and a desktop browser ignores the viewport meta entirely -- so the rule
+;;; is skipped there, which also keeps every fixed-width harness render unchanged.
+;;; MAX, not the meta's number outright, for the same reason: a 1280px window showing
+;;; a `width=1000' page uses 1280, exactly as a desktop browser does.
+;;;
+;;; The raster client is what makes this pay off here: it displays the render at
+;;; width:100% and maps clicks through naturalWidth/clientWidth, so a wider layout
+;;; arrives already scaled to the screen, still clickable, and pinch-zoomable.
+
+(defun effective-layout-width (requested doc)
+  "The width to lay DOC out at for a client whose viewport is REQUESTED px wide."
+  (if (or (null doc) (>= requested *mobile-ua-max-width*))
+      requested
+      (let ((m (viewport-meta-width doc)))
+        (cond ((eq m :device) requested)
+              ((and (integerp m) (plusp m)) (max requested m))
+              (t (max requested *default-mobile-layout-width*))))))
+
 (defun load-page (html &key (css "") (base "") (width 1024) (viewport-height 768) url fragment loader image-loader cookie-jar)
   "Parse HTML, build a fresh scripting context, run inline <script> and drain the
    initial timer/microtask queue, then render.  Returns a live PAGE.  If the scripts
@@ -244,6 +331,8 @@
   (let* ((fetch:*cookie-jar* (or cookie-jar fetch:*cookie-jar*))   ; bound for the whole render, incl. workers below
          (doc (progn (report-progress :parsing)
                      (let ((d (h:parse-html html))) (demath-dom d) d)))   ; MathJax LaTeX -> Unicode
+         ;; the page's own layout-viewport request, now that DOC exists to ask
+         (width (effective-layout-width width doc))
          (ssr-text (dom-text-length doc))   ; content the server-rendered markup carries
          ;; prefetch external CSS/JS in parallel before the cascade needs them
          (loader (if (and loader (plusp (length base)))
@@ -795,10 +884,31 @@ Returns T when a config was found and applied."
   ;; Scope the fine network hooks to the MAIN document fetch: the resolve/TLS/
   ;; download detail is for the page itself, not for the many subresources that
   ;; load-page fetches afterward (those are summarized by :loading / :scripting).
-  (let ((fetch:*cookie-jar* (or cookie-jar fetch:*cookie-jar*))
-        (st (get-internal-real-time)))
+  (let* ((desktop-ua fetch:*user-agent*)
+         (fetch:*cookie-jar* (or cookie-jar fetch:*cookie-jar*))
+         (fetch:*user-agent* (if (< width *mobile-ua-max-width*)
+                                 *mobile-user-agent*
+                                 desktop-ua))
+         (st (get-internal-real-time)))
    (let ((resp (let ((fetch:*progress* #'report-progress) (seal:*progress* #'report-progress))
-                 (fetch:fetch url-string))))
+                 (let ((r (fetch:fetch url-string)))
+                   ;; A MOBILE SITE THAT WON'T HAVE US IS WORSE THAN THE DESKTOP ONE.
+                   ;; Asking as a phone is what gets the mobile layout, but it can also
+                   ;; get a door shut: slashdot.org answers a phone UA with a redirect
+                   ;; to m.slashdot.org, which answers weft with 403 (a Cloudflare
+                   ;; interstitial) no matter WHICH UA it then sees -- measured with
+                   ;; both -- while the desktop host serves us normally.  Ending up on
+                   ;; a challenge page is a worse answer than the desktop page scaled
+                   ;; down, so a refusal falls back to the desktop request rather than
+                   ;; being reported as the page.  Only on the mobile attempt, only
+                   ;; once, and it is a retreat to the ordinary request -- not an
+                   ;; attempt to get past the refusal wearing a different hat.
+                   (if (and (eq fetch:*user-agent* *mobile-user-agent*)
+                            (>= (fetch:response-status r) 400))
+                       (let ((fetch:*user-agent* desktop-ua))
+                         (report-progress :loading "mobile site refused; desktop view")
+                         (fetch:fetch url-string))
+                       r)))))
     (let* ((headers (and resp (fetch:response-headers resp)))
            (ctype (and headers (fetch:get-header headers "content-type")))
            (raw (and resp (fetch:response-body resp)))
@@ -974,6 +1084,9 @@ Returns T when a config was found and applied."
   "Re-lay out PG at a new window width (and optionally viewport height) — the
    response to a window resize.  A PDF page (no live document) keeps its composed
    canvas; only its recorded width/viewport update."
+  ;; a resize re-asks the same question: the page's requested layout viewport wins
+  ;; over the new window width by exactly the rule the first layout used.
+  (setf new-width (effective-layout-width new-width (page-doc pg)))
   (setf (page-width pg) new-width)
   (when new-viewport-height (setf (page-viewport-height pg) new-viewport-height))
   (unless (page-doc pg)
