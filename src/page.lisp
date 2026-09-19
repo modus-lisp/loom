@@ -1062,6 +1062,14 @@ Returns T when a config was found and applied."
                            :viewport-height (page-viewport-height pg)
                            :scroll-to (page-fragment pg)
                            :selection (page-selection pg)))
+    ;; Hand the box tree to the scripting context as well: getBoundingClientRect
+    ;; reads it, and it should report the boxes that were just PAINTED rather than
+    ;; lay the document out a second time and risk a second opinion.  Clearing the
+    ;; dirty flag is the shell's own signal that the DOM and the pixels agree
+    ;; again, which is exactly when the cached layout becomes usable.
+    (when (page-ctx pg)
+      (setf (ws::context-layout (page-ctx pg)) root
+            (ws::context-scroll-y (page-ctx pg)) (page-scroll-y pg)))
     (setf (page-canvas pg) cv
           (page-root pg) root
           (page-styles pg) styles
