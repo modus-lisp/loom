@@ -367,6 +367,29 @@
                         :url url :fragment fragment :loader loader
                         :image-loader (or image-loader (make-image-loader base))
                         :font-loader (make-font-loader base)))
+         ;; scrollIntoView and window.scrollTo are requests, and only the shell can
+         ;; honour them.  Installed HERE rather than at render time because inline
+         ;; scripts run before the first paint: a page that scrolls itself during
+         ;; parse would otherwise move a scroll position the first render then
+         ;; overwrote, losing it silently.
+         (ignore1 (setf (ws::context-scroll-fn ctx)
+                        (lambda (y)
+                          ;; BEFORE THE FIRST RENDER THERE IS NO CONTENT HEIGHT to
+                          ;; clamp against, and clamping against zero pins every
+                          ;; scroll request to 0 -- which is what a page scrolling
+                          ;; itself from an inline script would have got.  Take the
+                          ;; request as given until a layout exists; %RENDER-ONCE
+                          ;; re-clamps the scroll position every time it renders, so
+                          ;; an over-large request is corrected rather than kept.
+                          (let ((y (if (plusp (page-content-height pg))
+                                       (clamp-scroll y (page-content-height pg)
+                                                     (page-viewport-height pg))
+                                       (max 0 (round y)))))
+                            (setf (page-scroll-y pg) y
+                                  (ws::context-scroll-y ctx) y)
+                            (ws:run-intersection-observations ctx)
+                            y))))
+         (ignore2 (progn ignore1 nil))
          ;; kick off <img> fetches now so they run concurrently with the scripts
          ;; below and are warm before layout — off the critical path.  The whole
          ;; render (prefetch workers AND the main-thread layout) shares one image
@@ -1085,7 +1108,11 @@ Returns T when a config was found and applied."
     ;; A new layout can have moved anything into or out of view, so this is one of
     ;; the moments an IntersectionObserver has to be re-run -- weft has no frame
     ;; loop to hang that on, so the shell says when the answer can have changed.
-    (when (page-ctx pg) (ws:run-intersection-observations (page-ctx pg)))
+    (when (page-ctx pg)
+      ;; a new layout can change both what is visible and what SIZE things are;
+      ;; a scroll (below) can change only the former, so only this site runs both
+      (ws:run-intersection-observations (page-ctx pg))
+      (ws:run-resize-observations (page-ctx pg)))
     ;; An open <select>'s list is drawn LAST, over the finished page: it is the
     ;; one thing on screen that is above the document rather than in it.
     (paint-open-menu pg)
