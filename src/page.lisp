@@ -360,7 +360,8 @@
          (loader (if (and loader (plusp (length base)))
                      (progn (report-progress :loading) (make-prefetching-loader doc base loader))
                      loader))
-         (ctx (ws:make-context doc :css css :width width :base base :loader loader))
+         (ctx (ws:make-context doc :css css :width width :base base :loader loader
+                               :viewport-height viewport-height))
          (pg (make-page :html html :css (or css "") :base base :doc doc :ctx ctx
                         :width width :viewport-height viewport-height
                         :url url :fragment fragment :loader loader
@@ -418,7 +419,8 @@
     (when (and (> ssr-text 500) (< (r:canvas-height (page-canvas pg)) 400))
       (let ((doc2 (let ((d (h:parse-html html))) (demath-dom d) d)))
         (setf (page-doc pg) doc2
-              (page-ctx pg) (ws:make-context doc2 :css css :width width :base base :loader loader)
+              (page-ctx pg) (ws:make-context doc2 :css css :width width :base base :loader loader
+                                             :viewport-height viewport-height)
               (page-js-error pg) "scripts left a degenerate render; rendered the static markup")
         (render-page pg)))
     (setf (page-title pg) (or (document-title (page-doc pg)) url "loom"))
@@ -1069,7 +1071,10 @@ Returns T when a config was found and applied."
     ;; again, which is exactly when the cached layout becomes usable.
     (when (page-ctx pg)
       (setf (ws::context-layout (page-ctx pg)) root
-            (ws::context-scroll-y (page-ctx pg)) (page-scroll-y pg)))
+            (ws::context-scroll-y (page-ctx pg)) (page-scroll-y pg)
+            ;; the root element's clientHeight IS the viewport height, which is how
+            ;; a page asks how tall the window is; only the shell knows it
+            (ws::context-viewport-height (page-ctx pg)) (page-viewport-height pg)))
     (setf (page-canvas pg) cv
           (page-root pg) root
           (page-styles pg) styles
