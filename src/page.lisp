@@ -1082,6 +1082,10 @@ Returns T when a config was found and applied."
           (page-content-height pg) (r:canvas-height cv)
           (page-scroll-y pg) (clamp-scroll (page-scroll-y pg)
                                             (r:canvas-height cv) (page-viewport-height pg)))
+    ;; A new layout can have moved anything into or out of view, so this is one of
+    ;; the moments an IntersectionObserver has to be re-run -- weft has no frame
+    ;; loop to hang that on, so the shell says when the answer can have changed.
+    (when (page-ctx pg) (ws:run-intersection-observations (page-ctx pg)))
     ;; An open <select>'s list is drawn LAST, over the finished page: it is the
     ;; one thing on screen that is above the document rather than in it.
     (paint-open-menu pg)
@@ -1550,9 +1554,16 @@ Returns T when a config was found and applied."
 (defun mouse-wheel (pg wheel-y)
   "Scroll the viewport by a wheel notch (WHEEL-Y).  Returns the new
    scroll-y.  Pure viewport math — no relayout."
-  (setf (page-scroll-y pg)
-        (clamp-scroll (+ (page-scroll-y pg) (wheel->scroll-delta wheel-y))
-                      (page-content-height pg) (page-viewport-height pg))))
+  (let ((y (clamp-scroll (+ (page-scroll-y pg) (wheel->scroll-delta wheel-y))
+                         (page-content-height pg) (page-viewport-height pg))))
+    (setf (page-scroll-y pg) y)
+    ;; Scrolling moves the viewport over unchanged geometry: no relayout, but the
+    ;; set of elements IN that viewport has changed, which is the other moment an
+    ;; IntersectionObserver must be re-run (and what lazy-loading waits for).
+    (when (page-ctx pg)
+      (setf (ws::context-scroll-y (page-ctx pg)) y)
+      (ws:run-intersection-observations (page-ctx pg)))
+    y))
 
 (defun key-target (pg)
   "The node keyboard events target: the focused element, which is the body when
