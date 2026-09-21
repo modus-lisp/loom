@@ -44,9 +44,22 @@
     (and el (let ((tx (dom:text-content el)))
               (and (plusp (length (string-trim '(#\Space #\Tab #\Newline #\Return) tx))) tx)))))
 
-(defparameter *js-budget* 6.0
+(defparameter *js-budget* 30.0
   "Seconds of wall-clock a page's scripts may run during load before the raster is
-   taken with the DOM as it stands.")
+   taken with the DOM as it stands.
+
+   EXCEEDING THIS PRODUCES A WRONG RENDER, NOT A SLOW ONE -- the page is caught
+   mid-execution with its DOM half-built, which is why the number matters.  It was
+   6s, and measured against slashdot.org that truncated every load: the page needs
+   a little over 20 seconds of script and finished cleanly only when given 60.  A
+   budget that stops a real page before it has finished building itself is not a
+   safety margin, it is a rendering bug with a timer attached.
+
+   30s is chosen to clear the heaviest page measured with room to spare while still
+   bounding a runaway: a self-rescheduling animation or poll loop is also held by
+   the requestAnimationFrame frame budget and RUN-EVENT-LOOP's task ceiling, so
+   this is the last line rather than the only one.  The real fix is a faster engine
+   -- 20 seconds of script for one news page is the number that should come down.")
 
 (defvar *progress* nil
   "When bound to a function of (PHASE &optional DETAIL), the load pipeline calls it
