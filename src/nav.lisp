@@ -13,6 +13,7 @@
   (:use #:cl)
   (:local-nicknames (#:r #:weft.render) (#:ui #:loom.ui))
   (:export #:serve #:run-glass #:attach #:attach-browser #:pump-loop #:on-key #:on-pointer #:stop
+           #:browser-app #:*browser-start*
            #:glass-app #:glass-app-page #:glass-app-fb
            ;; the live selection, and whether finishing one also copies it
            #:selection-text #:*copy-on-select*

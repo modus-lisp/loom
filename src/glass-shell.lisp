@@ -679,6 +679,31 @@
     (sb-thread:with-mutex ((glass-app-lock app)) (paint app))
     app))
 
+(defvar *browser-start* "about:blank"
+  "Where BROWSER-APP's windows open: about:blank appears at once, and the address bar is right
+there.")
+
+(defun browser-app (fb)
+  "A browser window for glass's window manager: its MAKE-FN contract, (values ON-KEY ON-POINTER
+DIRTY-P COPY-P CLOSE-FN).  ATTACH-BROWSER draws the chrome and the page into the window's FB and
+a thread of its own runs PUMP-LOOP, which paints only when the page or the chrome changed and
+touches FB when it does -- so FB's generation is the window's damage, and a pure scroll leaves
+a CopyRect hint the compositor takes (COPY-P).  Closing the window stops the pump.  It also
+hands over the live selection, which the window menu offers to say aloud."
+  (let ((app (attach-browser *browser-start* fb)) (seen -1))
+    (sb-thread:make-thread (lambda () (pump-loop app)) :name "loom-window-pump")
+    (values (lambda (down keysym) (on-key app down keysym))
+            (lambda (mask x y) (on-pointer app mask x y))
+            (lambda ()
+              (let ((g (glass:fb-generation fb)))
+                (and (/= g seen) (setf seen g) t)))
+            (lambda () (glass:fb-take-copy fb))
+            (lambda () (stop app))
+            nil                                      ; RESIZE-FN: the viewport is fixed for now
+            t                                        ; TEXT-P: the address bar, and page fields
+            ;; SELECTION-FN: what is highlighted at the moment somebody asks (Speak selection)
+            (lambda () (selection-text app)))))
+
 (defun latin1 (string)
   "RFB desktop names are a byte string; fold any char > 255 (e.g. a title's
    em-dash) to ASCII so glass can write the ServerInit name cleanly."
