@@ -19,7 +19,7 @@
    #:inview-lazy-pending-urls #:warm-image-urls #:warm-lazy-for-scroll
    #:page-doc
    #:page-canvas #:page-root #:page-styles #:page-width #:page-viewport-height
-   #:page-scroll-y #:page-content-height #:page-title #:page-cursor
+   #:page-scroll-y #:page-content-height #:page-band-top #:*paint-band* #:move-band #:page-title #:page-cursor
    #:page-hover-node #:page-url #:page-on-navigate #:page-js-error
    ;; input -> DOM
    #:node-at-page #:mouse-press #:mouse-release #:mouse-move #:mouse-wheel

@@ -150,22 +150,26 @@
    white.  The chrome is then drawn on top by the widget kit.  Caller holds the lock."
   (let* ((pg (glass-app-page app))
          (cv (and pg (loom:page-canvas pg)))
-         (cw (if cv (r:canvas-width cv) 0))
-         (ch (if cv (r:canvas-height cv) 0))
-         (px (and cv (r:canvas-pixels cv)))
          (fb (glass-app-fb app))
-         (fbpx (glass:fb-pixels fb))
          (fbw (glass:fb-width fb))
          (fbh (glass:fb-height fb))
          (ch-h (glass-app-chrome-h app))
          (page-h (- fbh ch-h))
-         (sy (if pg (min (loom:page-scroll-y pg) (max 0 (- ch page-h))) 0))
+         ;; the scroll range is the CONTENT's; the canvas may be only a band of it
+         (sy (if pg (min (loom:page-scroll-y pg)
+                         (max 0 (- (if cv (loom:page-content-height pg) 0) page-h)))
+                 0))
+         (cv (if (and pg (loom:move-band pg sy page-h)) (loom:page-canvas pg) cv))
+         (cw (if cv (r:canvas-width cv) 0))
+         (ch (if cv (r:canvas-height cv) 0))
+         (px (and cv (r:canvas-pixels cv)))
+         (fbpx (glass:fb-pixels fb))
          ;; scroll-perf (OFF by default): one clock pair around the whole blit, and
          ;; one around the chrome, so the two can be told apart.  See scroll-perf.lisp.
          (t0 (and *scroll-perf* (get-internal-real-time)))
          (ct 0))
     (glass:with-fb-locked (fb)
-      (blit-slice px cw ch fbpx fbw fbh sy ch-h)
+      (blit-slice px cw ch fbpx fbw fbh (- sy (if pg (loom:page-band-top pg) 0)) ch-h)
       ;; The chrome sits ABOVE the blit, so its pixels survive a paint untouched — and
       ;; redrawing it costs about as much as a sixth of the blit.  Draw it only when the
       ;; state it is a picture of has actually moved (CHROME-SIGNATURE), which during a
@@ -302,7 +306,9 @@
               ((or (loom::url-prefix-p "http:" start) (loom::url-prefix-p "https:" start))
                (loom:load-url start :width vw :viewport-height vh))
               (t (loom:load-file (namestring (loom::url->path start)) :width vw :viewport-height vh)))))
-    (loom:render-page pg)
+    ;; No RENDER-PAGE here: LOAD-PAGE (which every branch reaches) ends by rendering,
+    ;; and a PDF page has nothing to re-render.  A second call re-cascaded, re-laid
+    ;; and re-painted every page -- about 1.5 s of Hacker News's 5 s on a phone.
     pg))
 
 (defun nav-goto (app node)
@@ -734,3 +740,10 @@ hands over the live selection, which the window menu offers to say aloud."
    VNC on PORT.  The glass counterpart of LOOM:RUN — no SDL, no X."
   (let ((page (load-target (or start (namestring (loom::default-home))) width height)))
     (serve page :port port :max-iterations max-iterations :background background)))
+
+;;; A browser on a thread of its own: everything a page stores into (LOOM:WITH-THREAD-STATE), the
+;;; shell's paint counters and glass's glyph cache.
+(defmacro with-thread-state (() &body body)
+  `(let ((*spf* (make-spf)))
+     (glass:with-own-glyph-cache ()
+       (loom:with-thread-state () ,@body))))

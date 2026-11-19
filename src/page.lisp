@@ -15,6 +15,7 @@
   (width 1024) (viewport-height 768)
   canvas root styles
   (content-height 0)
+  (band-top 0)                          ; document row of the canvas's first row (*PAINT-BAND*)
   (scroll-y 0)
   (press-node nil)                      ; node that received the last mousedown
   (drag-control nil)                    ; text control a press landed in: motion while held extends its selection
@@ -452,7 +453,7 @@
     ;; collapses to near-nothing while the markup plainly carried a full article.  When
     ;; that happens, discard the mutated DOM and render the original markup without
     ;; scripts.  (Height, not ink: a dark-themed page legitimately inks most pixels.)
-    (when (and (> ssr-text 500) (< (r:canvas-height (page-canvas pg)) 400))
+    (when (and (> ssr-text 500) (< (page-content-height pg) 400))
       (let ((doc2 (let ((d (h:parse-html html))) (demath-dom d) d)))
         (setf (page-doc pg) doc2
               (page-ctx pg) (ws:make-context doc2 :css css :width width :base base :loader loader
@@ -1067,13 +1068,39 @@ Returns T when a config was found and applied."
 ;;; ---------------------------------------------------------------------------
 ;;; Rendering
 ;;; ---------------------------------------------------------------------------
+(defvar *paint-band* nil
+  "NIL to paint a page's whole length (a desktop: the shell scrolls by blitting a slice), or how
+   many viewport heights of it to keep painted -- a BAND around what is in view, repainted from
+   the same layout when a scroll leaves it (MOVE-BAND).  A phone sets it: a long article's whole
+   canvas is tens of megabytes.")
+
+(defun %paint-band (pg)
+  "The (top height) band to paint PG at, or NIL for its whole length."
+  (when *paint-band*
+    (let ((vh (round (page-viewport-height pg))))
+      (list (max 0 (- (round (page-scroll-y pg)) vh))
+            (max vh (round (* *paint-band* vh)))))))
+
+(defun move-band (pg sy page-h)
+  "When *PAINT-BAND* is on and the rows SY .. SY+PAGE-H are not all on PG's canvas, repaint the
+   band around them from the same box tree (no cascade, no layout).  T when it repainted."
+  (let ((cv (page-canvas pg)) (rp (page-repaint pg)) (top (page-band-top pg)))
+    (when (and *paint-band* cv rp
+               (or (< sy top) (> (+ sy page-h) (+ top (r:canvas-height cv))))
+               (< top (page-content-height pg)))
+      (let ((new (max 0 (- sy (floor (- (r:canvas-height cv) page-h) 2)))))
+        (setf (page-band-top pg) new
+              (page-canvas pg) (funcall rp (page-selection pg) new))
+        (paint-open-menu pg)
+        t))))
+
 (defun %render-once (pg deadline fetch-lazy)
   "One cascade + layout + paint pass of PG under image budget DEADLINE, storing the
    canvas/box-tree/styles/content-height back on PG and re-clamping scroll.  When
    FETCH-LAZY is NIL the post-layout lazy pass only defers (a probe layout to learn
    in-view positions); T fills the in-view lazy set (from the warmed cache).  Returns
    the laid-out box tree ROOT (so the caller can inspect it for in-view lazy images)."
-  (multiple-value-bind (cv root styles repaint)
+  (multiple-value-bind (cv root styles repaint content-h band-top)
       (let ((r:*image-loader* (page-image-loader pg))   ; network <img> over seal, cached
             (r:*font-loader* (page-font-loader pg))     ; @font-face web fonts over seal
             (r:*progress* #'report-progress)            ; :cascade / :layout / :painting
@@ -1099,7 +1126,8 @@ Returns T when a config was found and applied."
         (r:render-document (page-doc pg) :width (page-width pg) :css (page-css pg)
                            :viewport-height (page-viewport-height pg)
                            :scroll-to (page-fragment pg)
-                           :selection (page-selection pg)))
+                           :selection (page-selection pg)
+                           :band (%paint-band pg)))
     ;; Hand the box tree to the scripting context as well: getBoundingClientRect
     ;; reads it, and it should report the boxes that were just PAINTED rather than
     ;; lay the document out a second time and risk a second opinion.  Clearing the
@@ -1115,9 +1143,10 @@ Returns T when a config was found and applied."
           (page-root pg) root
           (page-styles pg) styles
           (page-repaint pg) repaint
-          (page-content-height pg) (r:canvas-height cv)
+          (page-content-height pg) (or content-h (r:canvas-height cv))
+          (page-band-top pg) (or band-top 0)
           (page-scroll-y pg) (clamp-scroll (page-scroll-y pg)
-                                            (r:canvas-height cv) (page-viewport-height pg)))
+                                            (page-content-height pg) (page-viewport-height pg)))
     ;; A new layout can have moved anything into or out of view, so this is one of
     ;; the moments an IntersectionObserver has to be re-run -- weft has no frame
     ;; loop to hang that on, so the shell says when the answer can have changed.
@@ -1280,7 +1309,7 @@ Returns T when a config was found and applied."
    the same picture with different pixels behind the glyphs."
   (let ((rp (page-repaint pg)))
     (when rp
-      (setf (page-canvas pg) (funcall rp (page-selection pg)))
+      (setf (page-canvas pg) (funcall rp (page-selection pg) (page-band-top pg)))
       (paint-open-menu pg)
       t)))
 
@@ -1422,10 +1451,15 @@ Returns T when a config was found and applied."
          (cv (page-canvas pg))
          (box (and node cv (control-box pg node))))
     (when box
-      (r:paint-select-menu cv box (ws:select-labels node)
-                           (ws:select-index (page-ctx pg) node)
-                           :highlight (page-menu-index pg)
-                           :max-y (r:canvas-height cv)))))
+      ;; the box is in document rows, the canvas starts at the band's top
+      (let ((top (page-band-top pg)))
+        (r::shift-box box 0 (- top))
+        (unwind-protect
+             (r:paint-select-menu cv box (ws:select-labels node)
+                                  (ws:select-index (page-ctx pg) node)
+                                  :highlight (page-menu-index pg)
+                                  :max-y (r:canvas-height cv))
+          (r::shift-box box 0 top))))))
 
 (defun menu-row-at (pg vx vy)
   "The popup row under viewport point (VX,VY), or NIL when the point is outside
@@ -1435,7 +1469,7 @@ Returns T when a config was found and applied."
          (box (and node cv (control-box pg node))))
     (when box
       (r:select-menu-row-at box (ws:select-labels node) vx (+ vy (page-scroll-y pg))
-                            (r:canvas-height cv)))))
+                            (page-content-height pg)))))
 
 (defun menu-row-count (pg)
   (let ((node (page-open-select pg))) (if node (length (ws:select-labels node)) 0)))
